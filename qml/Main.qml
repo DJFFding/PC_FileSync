@@ -295,46 +295,106 @@ ApplicationWindow {
                                 anchors.topMargin: parent.height*0.1
                                 spacing: 0
 
-                                Row {
+                                Item {
                                     id: select_login
                                     width: parent.width
                                     height: 35
-                                    z:1
+                                    z: 1
+
+                                    property int currentIndex: 0
+
+                                    // 账号登录
                                     Item {
+                                        id: accountTab
+
                                         width: parent.width / 2
                                         height: 35
+
                                         Text {
                                             text: "账号登录"
-                                            color: window.primary
-                                            font.pixelSize: 17
-                                            font.weight: Font.DemiBold
-                                            anchors.horizontalCenter: parent.horizontalCenter
-                                            anchors.top: parent.top
-                                            anchors.topMargin: 2
+
+                                            color: select_login.currentIndex === 0
+                                                   ? window.primary
+                                                   : "#69778E"
+
+                                            font.pixelSize: select_login.currentIndex === 0
+                                                            ? 17 : 16
+
+                                            font.weight: select_login.currentIndex === 0
+                                                         ? Font.DemiBold
+                                                         : Font.Normal
+
+                                            anchors.centerIn: parent
                                         }
-                                        Rectangle {
-                                            width: 132
-                                            height: 3
-                                            radius: 2
-                                            color: window.primary
-                                            anchors.horizontalCenter: parent.horizontalCenter
-                                            anchors.bottom: parent.bottom
+
+                                        MouseArea {
+                                            anchors.fill: parent
+
+                                            onClicked: {
+                                                select_login.currentIndex = 0
+                                            }
                                         }
                                     }
+
+                                    // 手机登录
                                     Item {
+                                        id: phoneTab
+
                                         width: parent.width / 2
                                         height: 35
+
+                                        anchors.right: parent.right
+
                                         Text {
                                             text: "手机登录"
-                                            color: "#69778E"
-                                            font.pixelSize: 16
-                                            anchors.horizontalCenter: parent.horizontalCenter
-                                            anchors.top: parent.top
-                                            anchors.topMargin: 3
+
+                                            color: select_login.currentIndex === 1
+                                                   ? window.primary
+                                                   : "#69778E"
+
+                                            font.pixelSize: select_login.currentIndex === 1
+                                                            ? 17 : 16
+
+                                            font.weight: select_login.currentIndex === 1
+                                                         ? Font.DemiBold
+                                                         : Font.Normal
+
+                                            anchors.centerIn: parent
+                                        }
+
+                                        MouseArea {
+                                            anchors.fill: parent
+
+                                            onClicked: {
+                                                select_login.currentIndex = 1
+                                            }
+                                        }
+                                    }
+
+                                    // 指示器
+                                    Rectangle {
+                                        id: indicator
+
+                                        width: 132
+                                        height: 3
+                                        radius: 2
+
+                                        color: window.primary
+
+                                        y: parent.height - height
+
+                                        x: select_login.currentIndex === 0
+                                           ? accountTab.x + (accountTab.width - width) / 2
+                                           : phoneTab.x + (phoneTab.width - width) / 2
+
+                                        Behavior on x {
+                                            NumberAnimation {
+                                                duration: 280
+                                                easing.type: Easing.OutCubic
+                                            }
                                         }
                                     }
                                 }
-
                                 Rectangle {
                                     id:select_login_border_bottom
                                     transform: Translate {
@@ -514,4 +574,5 @@ ApplicationWindow {
             enabled: false
         }
     }
+
 }
