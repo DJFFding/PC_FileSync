@@ -406,83 +406,487 @@ ApplicationWindow {
                                 }
 
                                 Item {
-                                   width: 1
-                                   height: 32
+                                    width: 1
+                                    height: 32
                                 }
-
-                                LoginField {
-                                    id: accountField
-                                    width: parent.width
-                                    height: 54
-                                    icon: "user"
-                                    placeholder: "请输入邮箱/手机号"
-                                }
-
+                                // ============================================================
+                                // 登录内容区域
+                                // ============================================================
                                 Item {
-                                   width: 1
-                                   height: 14
-                                }
+                                    id: login_content
 
-                                LoginField {
-                                    id: passwordField
                                     width: parent.width
-                                    height: 54
-                                    icon: "lock"
-                                    placeholder: "请输入密码"
-                                    password: true
-                                }
+                                    height: accountField.accountError||phoneField.accountError
+                                                ? 218
+                                                : 190
 
-                                RowLayout {
-                                    width: parent.width
-                                    height: 44
-                                    anchors.topMargin: 14
+                                    Behavior on height {
+                                        NumberAnimation {
+                                            duration: 180
+                                            easing.type: Easing.OutCubic
+                                        }
+                                    }
 
-                                    CheckBox {
-                                        id: remember
-                                        text: "记住账号"
-                                        checked: true
-                                        spacing: 8
-                                        indicator: Rectangle {
-                                            implicitWidth: 18
-                                            implicitHeight: 18
-                                            x: remember.leftPadding
-                                            y: parent.height / 2 - height / 2
-                                            radius: 4
-                                            border.width: remember.checked ? 0 : 1
-                                            border.color: "#B9C4D5"
-                                            color: remember.checked ? window.primary : "white"
-                                            Text {
-                                                visible: remember.checked
-                                                text: "✓"
-                                                color: "white"
-                                                font.pixelSize: 13
-                                                font.bold: true
-                                                anchors.centerIn: parent
+                                    clip: true
+
+
+                                    // ========================================================
+                                    // 账号登录面板
+                                    // ========================================================
+                                    Item {
+                                        id: accountLoginPanel
+
+                                        width: login_content.width
+                                        height: login_content.height
+
+                                        x: select_login.currentIndex === 0
+                                           ? 0
+                                           : -login_content.width
+
+                                        opacity: select_login.currentIndex === 0
+                                                 ? 1
+                                                 : 0
+
+                                        scale: select_login.currentIndex === 0
+                                               ? 1
+                                               : 0.98
+
+
+                                        Behavior on x {
+                                            NumberAnimation {
+                                                duration: 360
+                                                easing.type: Easing.OutCubic
                                             }
                                         }
-                                        contentItem: Text {
-                                            text: parent.text
-                                            color: "#6D7B92"
-                                            font.pixelSize: 13
-                                            verticalAlignment: Text.AlignVCenter
-                                            leftPadding: remember.indicator.width + remember.spacing
+
+                                        Behavior on opacity {
+                                            NumberAnimation {
+                                                duration: 260
+                                                easing.type: Easing.OutCubic
+                                            }
+                                        }
+
+                                        Behavior on scale {
+                                            NumberAnimation {
+                                                duration: 360
+                                                easing.type: Easing.OutCubic
+                                            }
+                                        }
+
+
+                                        Column {
+                                            width: parent.width
+                                            spacing: 14
+
+
+                                            Item {
+                                                width: parent.width
+                                                height: accountField.accountError ? 82 : 54
+
+                                                Behavior on height {
+                                                    NumberAnimation {
+                                                        duration: 140
+                                                        easing.type: Easing.OutCubic
+                                                    }
+                                                }
+
+                                                LoginField {
+                                                    id: accountField
+
+                                                    anchors.left: parent.left
+                                                    anchors.right: parent.right
+                                                    anchors.top: parent.top
+
+                                                    height: 54
+
+                                                    icon: "user"
+                                                    placeholder: "请输入邮箱/手机号"
+                                                    validateAccount: true
+                                                    validateWhat: LoginField.ValidateWhat.Phone|LoginField.ValidateWhat.Email
+                                                }
+                                            }
+
+
+                                            // -------------------------
+                                            // 密码
+                                            // -------------------------
+                                            LoginField {
+                                                id: passwordField
+
+                                                width: parent.width
+                                                height: 54
+
+                                                icon: "lock"
+                                                placeholder: "请输入密码"
+
+                                                password: true
+                                            }
+
+
+                                            // -------------------------
+                                            // 底部操作
+                                            // -------------------------
+                                            RowLayout {
+                                                width: parent.width
+                                                height: 44
+
+                                                CheckBox {
+                                                    id: remember
+
+                                                    text: "记住账号"
+                                                    checked: true
+
+                                                    spacing: 8
+
+                                                    indicator: Rectangle {
+                                                        implicitWidth: 18
+                                                        implicitHeight: 18
+
+                                                        x: remember.leftPadding
+                                                        y: parent.height / 2 - height / 2
+
+                                                        radius: 4
+
+                                                        border.width: remember.checked ? 0 : 1
+                                                        border.color: "#B9C4D5"
+
+                                                        color: remember.checked
+                                                               ? window.primary
+                                                               : "white"
+
+                                                        Text {
+                                                            visible: remember.checked
+
+                                                            text: "✓"
+                                                            color: "white"
+
+                                                            font.pixelSize: 13
+                                                            font.bold: true
+
+                                                            anchors.centerIn: parent
+                                                        }
+                                                    }
+
+                                                    contentItem: Text {
+                                                        text: parent.text
+
+                                                        color: "#6D7B92"
+                                                        font.pixelSize: 13
+
+                                                        verticalAlignment: Text.AlignVCenter
+
+                                                        leftPadding: remember.indicator.width
+                                                                     + remember.spacing
+                                                    }
+                                                }
+
+
+                                                Item {
+                                                    Layout.fillWidth: true
+                                                }
+
+
+                                                Text {
+                                                    text: "忘记密码？"
+
+                                                    color: window.primary
+                                                    font.pixelSize: 13
+
+                                                    verticalAlignment: Text.AlignVCenter
+
+                                                    MouseArea {
+                                                        anchors.fill: parent
+
+                                                        cursorShape: Qt.PointingHandCursor
+
+                                                        onClicked: {
+                                                            console.log("忘记密码")
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
 
-                                    Item {
-                                        Layout.fillWidth: true
-                                    }
 
-                                    Text {
-                                        text: "忘记密码？"
-                                        color: window.primary
-                                        font.pixelSize: 13
-                                        verticalAlignment: Text.AlignVCenter
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: {
-                                                console.log("忘记密码")
+                                    // ========================================================
+                                    // 手机登录面板
+                                    // ========================================================
+                                    Item {
+                                        id: phoneLoginPanel
+
+                                        width: login_content.width
+                                        height: login_content.height
+
+                                        x: select_login.currentIndex === 1
+                                           ? 0
+                                           : login_content.width
+
+                                        opacity: select_login.currentIndex === 1
+                                                 ? 1
+                                                 : 0
+
+                                        scale: select_login.currentIndex === 1
+                                               ? 1
+                                               : 0.98
+
+
+                                        Behavior on x {
+                                            NumberAnimation {
+                                                duration: 360
+                                                easing.type: Easing.OutCubic
+                                            }
+                                        }
+
+                                        Behavior on opacity {
+                                            NumberAnimation {
+                                                duration: 260
+                                                easing.type: Easing.OutCubic
+                                            }
+                                        }
+
+                                        Behavior on scale {
+                                            NumberAnimation {
+                                                duration: 360
+                                                easing.type: Easing.OutCubic
+                                            }
+                                        }
+
+
+                                        Column {
+                                            width: parent.width
+                                            spacing: 14
+
+
+                                            // ------------------------------------------------
+                                            // 手机号
+                                            // ------------------------------------------------
+                                            Item {
+                                                width: parent.width
+                                                height: phoneField.accountError ? 82 : 54
+
+                                                Behavior on height {
+                                                    NumberAnimation {
+                                                        duration: 140
+                                                        easing.type: Easing.OutCubic
+                                                    }
+                                                }
+                                                LoginField {
+                                                    id: phoneField
+
+                                                    width: parent.width
+                                                    height: 54
+
+                                                    icon: "smartphone"
+                                                    placeholder: "请输入手机号"
+                                                    validateAccount: true
+                                                    validateWhat: LoginField.ValidateWhat.Phone
+                                                }
+                                            }
+
+
+                                            // ------------------------------------------------
+                                            // 验证码
+                                            // ------------------------------------------------
+                                            Row {
+                                                width: parent.width
+                                                height: 54
+
+                                                spacing: 10
+
+
+                                                LoginField {
+                                                    id: verifyCodeField
+
+                                                    width: parent.width - 114
+                                                    height: 54
+
+                                                    icon: "verification_code"
+                                                    placeholder: "请输入短信验证码"
+                                                }
+
+
+                                                Rectangle {
+                                                    id: sendCodeButton
+
+                                                    width: 104
+                                                    height: 54
+
+                                                    radius: 9
+
+                                                    color: sendCodeMouseArea.containsMouse
+                                                           ? window.primaryDark
+                                                           : window.primary
+
+
+                                                    Text {
+                                                        id: sendCodeText
+
+                                                        anchors.centerIn: parent
+
+                                                        text: phoneLoginPanel.countDown > 0
+                                                              ? phoneLoginPanel.countDown + " 秒"
+                                                              : "获取验证码"
+
+                                                        color: "white"
+
+                                                        font.pixelSize: 13
+                                                        font.weight: Font.DemiBold
+                                                    }
+
+
+                                                    MouseArea {
+                                                        id: sendCodeMouseArea
+
+                                                        anchors.fill: parent
+
+                                                        hoverEnabled: true
+
+                                                        cursorShape: phoneLoginPanel.countDown > 0
+                                                                      ? Qt.ArrowCursor
+                                                                      : Qt.PointingHandCursor
+
+
+                                                        onClicked: {
+
+                                                            if (phoneLoginPanel.countDown > 0)
+                                                                return
+
+                                                            if (phoneField.text.length === 0) {
+                                                                console.log("请输入手机号")
+                                                                return
+                                                            }
+
+                                                            console.log("发送验证码")
+
+                                                            phoneLoginPanel.countDown = 60
+                                                            codeTimer.start()
+                                                        }
+                                                    }
+
+
+                                                    Behavior on color {
+                                                        ColorAnimation {
+                                                            duration: 120
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+
+                                            // ------------------------------------------------
+                                            // 底部操作
+                                            // ------------------------------------------------
+                                            RowLayout {
+                                                width: parent.width
+                                                height: 44
+
+
+                                                CheckBox {
+                                                    id: rememberPhone
+
+                                                    text: "记住手机号"
+                                                    checked: true
+
+                                                    spacing: 8
+
+
+                                                    indicator: Rectangle {
+                                                        implicitWidth: 18
+                                                        implicitHeight: 18
+
+                                                        x: rememberPhone.leftPadding
+                                                        y: parent.height / 2 - height / 2
+
+                                                        radius: 4
+
+                                                        border.width: rememberPhone.checked ? 0 : 1
+                                                        border.color: "#B9C4D5"
+
+                                                        color: rememberPhone.checked
+                                                               ? window.primary
+                                                               : "white"
+
+
+                                                        Text {
+                                                            visible: rememberPhone.checked
+
+                                                            text: "✓"
+
+                                                            color: "white"
+
+                                                            font.pixelSize: 13
+                                                            font.bold: true
+
+                                                            anchors.centerIn: parent
+                                                        }
+                                                    }
+
+
+                                                    contentItem: Text {
+                                                        text: parent.text
+
+                                                        color: "#6D7B92"
+
+                                                        font.pixelSize: 13
+
+                                                        verticalAlignment: Text.AlignVCenter
+
+                                                        leftPadding: rememberPhone.indicator.width
+                                                                     + rememberPhone.spacing
+                                                    }
+                                                }
+
+
+                                                Item {
+                                                    Layout.fillWidth: true
+                                                }
+
+
+                                                Text {
+                                                    text: "收不到验证码？"
+
+                                                    color: window.primary
+
+                                                    font.pixelSize: 13
+
+                                                    verticalAlignment: Text.AlignVCenter
+
+
+                                                    MouseArea {
+                                                        anchors.fill: parent
+
+                                                        cursorShape: Qt.PointingHandCursor
+
+                                                        onClicked: {
+                                                            console.log("收不到验证码")
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+
+                                        // ====================================================
+                                        // 验证码倒计时
+                                        // ====================================================
+                                        property int countDown: 0
+
+                                        Timer {
+                                            id: codeTimer
+
+                                            interval: 1000
+                                            repeat: true
+
+                                            onTriggered: {
+
+                                                if (phoneLoginPanel.countDown > 0) {
+                                                    phoneLoginPanel.countDown--
+                                                }
+
+                                                if (phoneLoginPanel.countDown <= 0) {
+                                                    stop()
+                                                }
                                             }
                                         }
                                     }
