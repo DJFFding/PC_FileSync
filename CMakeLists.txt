@@ -49,6 +49,8 @@ qt_add_qml_module(FileSync
         assets/icon-wechat.svg
         assets/icon-qq.svg
         assets/icon-apple.svg
+        assets/icon-smartphone.svg
+        assets/icon-verification_code.svg
         assets/window-close.svg
         assets/window-maximize.svg
         assets/window-minimize.svg
