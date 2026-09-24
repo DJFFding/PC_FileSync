@@ -10,6 +10,8 @@ Item {
     property string placeholder: ""
     property bool password: false
     property bool password_can_see: false
+    property string error_text: ""
+    property bool focus_error: false
 
     // 外部可以正常读取和设置
     property alias text: field.text
@@ -19,7 +21,12 @@ Item {
     enum ValidateWhat {
         None = 0,
         Phone = 0b1,
-        Email = 0b10
+        Email = 0b10,
+        UserName = 0b100,
+        Password = 0b1000,
+        EmailCode= 0b10000,
+        PhoneCode =0b100000,
+        RePassword=0b1000000
     }
     property int validateWhat: LoginField.ValidateWhat.None
 
@@ -60,9 +67,9 @@ Item {
     }
 
     readonly property bool accountError: {
-        return validateAccount &&
+        return focus_error || (validateAccount &&
                hasInput &&
-               !accountValid
+               !accountValid)
     }
 
     readonly property bool accountSuccess: {
@@ -72,35 +79,309 @@ Item {
     }
 
     // ============================================================
-    // 邮箱 / 手机号校验
+    // 校验
     // ============================================================
 
-    function isValidAccount(value) {
-        // 手机号
-        var phoneReg = /^1[3-9][0-9]{9}$/
-
+    function validateEmail(email){
+         if (!email || email.length === 0)
+             return {
+                 valid: false,
+                 message: "请输入邮箱"
+             }
         // 常用邮箱
         var emailReg = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/
+        return {
+            valid:emailReg.test(email),
+            message:"请输入正确的邮箱"
+         }
+    }
+    function validatePhone(phone){
+        if (!phone || phone.length === 0)
+            return {
+                valid: false,
+                message: "请输入手机号"
+            }
+        // 手机号
+        var phoneReg = /^1[3-9][0-9]{9}$/
+        return {
+            valid:phoneReg.test(phone),
+            message:"请输入正确的手机号"
+        }
+    }
+
+
+
+    function isValidAccount(value) {
+        focus_error = false;
 
         // 不进行任何校验
-        if (validateWhat === LoginField.ValidateWhat.None) {
+        if (validateWhat === LoginField.ValidateWhat.None
+        ||  validateWhat === LoginField.ValidateWhat.EmailCode
+        ||  validateWhat === LoginField.ValidateWhat.PhoneCode
+        ||  validateWhat === LoginField.ValidateWhat.RePassword) {
             return true
+        }
+        else if (validateWhat === LoginField.ValidateWhat.UserName){
+            var username = value
+            if (!username || username.length === 0) {
+                return true
+            }
+            return root.validateUsername(username).valid;
+        }
+        else if (validateWhat === LoginField.ValidateWhat.Password){
+            var password = value
+            if (!password || password.length === 0) {
+                return true
+            }
+            return root.validatePassword(password).valid;
         }
 
         var valid = false
 
         // 需要检查手机号
         if ((validateWhat & LoginField.ValidateWhat.Phone) !== 0) {
-            valid = valid || phoneReg.test(value)
+            valid = valid ||validatePhone(value).valid
         }
 
         // 需要检查邮箱
         if ((validateWhat & LoginField.ValidateWhat.Email) !== 0) {
-            valid = valid || emailReg.test(value)
+            valid = valid || validateEmail(value).valid
         }
 
         return valid
     }
+
+    function validatePassword(password) {
+        // 1. 是否为空
+        if (!password || password.length === 0) {
+            return {
+                valid: false,
+                message: "请输入密码"
+            }
+        }
+
+        // 2. 长度必须在 8~20 位（包含）
+        if (password.length < 8 || password.length > 20) {
+            return {
+                valid: false,
+                message: "密码长度必须为 8-20 位"
+            }
+        }
+
+        // 3. 不允许空格
+        if (/\s/.test(password)) {
+            return {
+                valid: false,
+                message: "密码不能包含空格"
+            }
+        }
+
+        // 4. 至少包含一个字母
+        if (!/[A-Za-z]/.test(password)) {
+            return {
+                valid: false,
+                message: "密码至少需要包含一个字母"
+            }
+        }
+
+        // 5. 至少包含一个数字
+        if (!/[0-9]/.test(password)) {
+            return {
+                valid: false,
+                message: "密码至少需要包含一个数字"
+            }
+        }
+
+        // 6. 拒绝全部由同一个字符组成
+        // 例如：aaaaaaaa、11111111、!!!!!!!!
+        if (/^(.)\1+$/.test(password)) {
+            return {
+                valid: false,
+                message: "密码不能全部使用相同字符"
+            }
+        }
+
+        // 7. 拒绝连续重复字符过多
+        // 例如：aaaa1234、1111abcd
+        if (/(.)\1{3,}/.test(password)) {
+            return {
+                valid: false,
+                message: "密码中不能包含连续重复的 4 个及以上字符"
+            }
+        }
+
+        // 8. 常见弱密码
+        var weakPasswords = [
+            "12345678",
+            "123456789",
+            "1234567890",
+            "password",
+            "password1",
+            "password123",
+            "qwerty123",
+            "qwertyui",
+            "qwertyuiop",
+            "abcdefgh",
+            "abcdefgh1",
+            "abc123456",
+            "11111111",
+            "00000000",
+            "88888888",
+            "66666666",
+            "87654321"
+        ]
+
+        var lowerPassword = password.toLowerCase()
+
+        for (var i = 0; i < weakPasswords.length; ++i) {
+            if (lowerPassword === weakPasswords[i]) {
+                return {
+                    valid: false,
+                    message: "该密码过于常见，请更换一个更安全的密码"
+                }
+            }
+        }
+
+        // 9. 拒绝纯数字连续序列
+        if (/^(0123456789|1234567890|9876543210|0987654321)$/.test(password)) {
+            return {
+                valid: false,
+                message: "密码不能使用连续数字"
+            }
+        }
+
+        // 全部通过
+        return {
+            valid: true,
+            message: ""
+        }
+    }
+
+
+
+    // 校验用户名
+    // 返回：
+    // {
+    //     valid: true / false,
+    //     message: "错误原因"
+    // }
+
+    function validateUsername(username) {
+        // 1. 必须填写
+        if (!username || username.length === 0) {
+            return {
+                valid: false,
+                message: "请输入用户名"
+            }
+        }
+
+        // 2. 不允许首尾存在空白
+        if (username !== username.trim()) {
+            return {
+                valid: false,
+                message: "用户名首尾不能有空格"
+            }
+        }
+
+        // 3. 长度限制：3~20 个字符
+        if (username.length < 3) {
+            return {
+                valid: false,
+                message: "用户名至少需要 3 个字符"
+            }
+        }
+
+        if (username.length > 20) {
+            return {
+                valid: false,
+                message: "用户名最多 20 个字符"
+            }
+        }
+
+        // 4. 只允许：
+        // 中文、英文字母、数字、下划线、短横线
+        var allowedPattern = /^[\u4e00-\u9fa5A-Za-z0-9_-]+$/
+
+        if (!allowedPattern.test(username)) {
+            return {
+                valid: false,
+                message: "用户名只能包含中文、字母、数字、下划线或短横线"
+            }
+        }
+
+        // 5. 第一位必须是中文或英文字母
+        if (!/^[\u4e00-\u9fa5A-Za-z]/.test(username)) {
+            return {
+                valid: false,
+                message: "用户名必须以中文或英文字母开头"
+            }
+        }
+
+        // 6. 不能全部是数字
+        if (/^[0-9]+$/.test(username)) {
+            return {
+                valid: false,
+                message: "用户名不能全部由数字组成"
+            }
+        }
+
+        // 7. 不允许连续两个下划线
+        if (/__/.test(username)) {
+            return {
+                valid: false,
+                message: "用户名不能包含连续的下划线"
+            }
+        }
+
+        // 8. 不允许连续两个短横线
+        if (/--/.test(username)) {
+            return {
+                valid: false,
+                message: "用户名不能包含连续的短横线"
+            }
+        }
+
+        // 9. 不能以下划线或短横线结尾
+        if (/[_-]$/.test(username)) {
+            return {
+                valid: false,
+                message: "用户名不能以下划线或短横线结尾"
+            }
+        }
+
+        // 10. 常见保留用户名
+        var reservedUsernames = [
+            "admin",
+            "administrator",
+            "root",
+            "system",
+            "operator",
+            "support",
+            "service",
+            "guest",
+            "user",
+            "null",
+            "undefined",
+            "test",
+            "demo"
+        ]
+
+        var lowerUsername = username.toLowerCase()
+
+        if (reservedUsernames.indexOf(lowerUsername) !== -1) {
+            return {
+                valid: false,
+                message: "该用户名不可使用，请更换其他用户名"
+            }
+        }
+
+        // 11. 校验通过
+        return {
+            valid: true,
+            message: ""
+        }
+    }
+
     // ============================================================
     // 外框
     // ============================================================
@@ -347,11 +628,23 @@ Item {
             if(root.validateWhat & LoginField.ValidateWhat.Email && root.validateWhat & LoginField.ValidateWhat.Phone){
                 return "请输入正确的邮箱或手机号"
             }else if(root.validateWhat & LoginField.ValidateWhat.Email){
-                return "请输入正确的邮箱"
-            }else if( root.validateWhat & LoginField.ValidateWhat.Phone){
-                 return "请输入正确的手机号"
+                var email = root.text
+                var result = root.validateEmail(email)
+                return result.message
+            }else if(root.validateWhat & LoginField.ValidateWhat.Phone){
+                var phone = root.text
+                result = root.validatePhone(phone)
+                return result.message
+            }else if(root.validateWhat === LoginField.ValidateWhat.UserName){
+                var username = root.text
+                result = root.validateUsername(username)
+                return result.message
+            }else if(root.validateWhat === LoginField.ValidateWhat.Password){
+                var password = root.text
+                result = root.validatePassword(password)
+                return result.message
             }else{
-                return ""
+                return error_text
             }
         }
         color: root.errorBorderColor
