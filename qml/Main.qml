@@ -991,18 +991,21 @@ ApplicationWindow {
                                                 font.pixelSize: 13
                                             }
                                         }
-
+                                        Item{
+                                            width:1
+                                            height:28
+                                        }
                                         Row {
                                             width: parent.width
                                             height: 38
-                                            topPadding: 28
                                             Rectangle {
-                                                width: 130
+                                                width: (parent.width-thirdParityLoginText.width)/2
                                                 height: 1
                                                 color: "#E6EAF1"
                                                 anchors.verticalCenter: parent.verticalCenter
                                             }
                                             Text {
+                                                id: thirdParityLoginText
                                                 text: "第三方登录"
                                                 color: "#A0AABD"
                                                 font.pixelSize: 12
@@ -1011,7 +1014,7 @@ ApplicationWindow {
                                                 anchors.verticalCenter: parent.verticalCenter
                                             }
                                             Rectangle {
-                                                width: 130
+                                                width:  (parent.width-thirdParityLoginText.width)/2
                                                 height: 1
                                                 color: "#E6EAF1"
                                                 anchors.verticalCenter: parent.verticalCenter
@@ -1036,10 +1039,6 @@ ApplicationWindow {
                                             }
                                         }
                                     }
-
-                                    // ============================================================
-                                    // 注册页面
-                                    // ============================================================
 
                                     // ============================================================
                                     // 注册页面：账号注册 / 手机注册
@@ -1750,7 +1749,7 @@ ApplicationWindow {
                                                     }
                                                     var phone_code = registerSmsCodeField.text
                                                     if (!phone_code || phone_code.length === 0) {
-                                                        var error_message = "请输入短信验证码";
+                                                        error_message = "请输入短信验证码";
                                                         registerSmsCodeField.focus_error = true;
                                                         registerSmsCodeField.error_text = error_message;
                                                         registerStatusMessage.text = error_message;
@@ -1758,7 +1757,7 @@ ApplicationWindow {
                                                     }
 
 
-                                                    var password = registerPhonePasswordField.text
+                                                    password = registerPhonePasswordField.text
                                                     result = registerPhonePasswordField.validatePassword(password)
                                                     if(!result.valid){
                                                         registerPhonePasswordField.focus_error = true;
