@@ -551,6 +551,12 @@ Item {
 
                 fillMode: Image.PreserveAspectFit
                 opacity: 0.75
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                           root.password_can_see = !root.password_can_see
+                        }
+                    }
             }
         }
 
@@ -577,7 +583,7 @@ Item {
 
             placeholderText: root.placeholder
 
-            echoMode: root.password
+            echoMode: root.password&&!root.password_can_see
                       ? TextInput.Password
                       : TextInput.Normal
 
