@@ -59,15 +59,17 @@ ApplicationWindow {
                 topRightRadius: 0
                 bottomRightRadius: 0
                 antialiasing: true
-
-                Column {
+                ColumnLayout {
                     anchors.fill: parent
-                    anchors.margins: 0
                     spacing: 0
 
+                    // ============================================================
+                    // Logo
+                    // ============================================================
                     Item {
-                        width: sidebar.width
-                        height: 78
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 78
+
                         Image {
                             source: "qrc:/qt/qml/FileSync/assets/logo.svg"
                             width: 36
@@ -87,8 +89,11 @@ ApplicationWindow {
                         }
                     }
 
+                    // ============================================================
+                    // 导航
+                    // ============================================================
                     Column {
-                        width: parent.width
+                        Layout.fillWidth: true
                         spacing: 5
                         topPadding: 8
                         NavItem {
@@ -124,23 +129,36 @@ ApplicationWindow {
                         }
                     }
 
+                    // ============================================================
+                    // 分隔线
+                    // ============================================================
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: sidebar.width - 32
+                        Layout.preferredHeight: 1
+
+                        color: "#273449"
+
+                        Layout.leftMargin: 16
+                        Layout.rightMargin: 16
+                        Layout.topMargin: 8
+                    }
+
+                    // ============================================================
+                    // 撑开剩余空间，把底部内容推到底部
+                    // ============================================================
                     Item {
-                        width: 1
-                        height: 1
+                        Layout.fillWidth: true
                         Layout.fillHeight: true
                     }
 
-                    Rectangle {
-                        width: sidebar.width - 32
-                        height: 1
-                        color: "#273449"
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        anchors.bottomMargin: 16
-                    }
-
+                    // ============================================================
+                    // 用户信息
+                    // ============================================================
                     Item {
-                        width: sidebar.width
-                        height: 92
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 92
+                        Layout.bottomMargin: 10
                         Image {
                             source: "qrc:/qt/qml/FileSync/assets/avatar.svg"
                             width: 42
