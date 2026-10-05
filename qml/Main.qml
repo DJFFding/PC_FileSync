@@ -18,6 +18,7 @@ ApplicationWindow {
     // 主题色
     property color primary: "#4B6EF5"
     property color primaryDark: "#3558DD"
+    property color primarySuccess: "#34C759"
     property color textDark: "#1E2A45"
     property color textMid: "#71809B"
     property color textLight: "#A9B5C9"

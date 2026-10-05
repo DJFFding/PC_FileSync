@@ -36,6 +36,7 @@ Item {
 
     property color normalBorderColor: "#E5EAF2"
     property color focusBorderColor: window.primary
+    property color successBorderColor: window.primarySuccess
     property color errorBorderColor: "#E96A6A"
 
     property color normalBackgroundColor: "#FFFFFF"
@@ -412,7 +413,7 @@ Item {
 
             // 正确输入
             if (root.accountSuccess)
-                return root.focusBorderColor
+                return root.successBorderColor
 
             // 获得焦点
             if (field.activeFocus)
@@ -514,7 +515,7 @@ Item {
 
                 color: root.accountError
                        ? root.errorBorderColor
-                       : window.primary
+                       : window.primarySuccess
 
                 scale: visible ? 1.0 : 0.75
                 opacity: visible ? 1.0 : 0.0
