@@ -553,6 +553,8 @@ Item {
                 opacity: 0.75
                 MouseArea {
                     anchors.fill: parent
+                    hoverEnabled: true   // 开启悬停检测！
+                    cursorShape: Qt.PointingHandCursor // 手型光标
                     onClicked: {
                            root.password_can_see = !root.password_can_see
                         }
