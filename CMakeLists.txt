@@ -19,6 +19,8 @@ qt_add_qml_module(FileSyncComponents
     VERSION 1.0
     OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/FileSyncComponents
     QML_FILES
+        qml/sections/LoginSection.qml
+
         qml/components/ThirdParty.qml
         qml/components/Feature.qml
         qml/components/LoginField.qml
