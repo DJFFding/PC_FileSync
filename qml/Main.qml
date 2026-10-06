@@ -157,6 +157,8 @@ ApplicationWindow {
                     // 用户信息
                     // ============================================================
                     Item {
+                        id:user_info
+                        property bool isLogin: false
                         Layout.fillWidth: true
                         Layout.preferredHeight: 92
                         Layout.bottomMargin: 10
@@ -170,7 +172,7 @@ ApplicationWindow {
                             anchors.topMargin: 8
                         }
                         Text {
-                            text: "张三"
+                            text: "未登录"
                             color: "#EAF0FF"
                             font.pixelSize: 14
                             font.weight: Font.DemiBold
@@ -180,7 +182,7 @@ ApplicationWindow {
                             anchors.topMargin: 11
                         }
                         Text {
-                            text: "zhangsan@example.com"
+                            text: "登录后同步您的文件"
                             color: "#7F8DA5"
                             font.pixelSize: 10
                             anchors.left: parent.left
@@ -192,14 +194,14 @@ ApplicationWindow {
                             width: 8
                             height: 8
                             radius: 4
-                            color: "#45D483"
+                            color: user_info.isLogin ? "#45D483" : "#9CA3AF"
                             anchors.left: parent.left
                             anchors.leftMargin: 23
                             anchors.bottom: parent.bottom
                             anchors.bottomMargin: 12
                         }
                         Text {
-                            text: "已连接"
+                            text: user_info.isLogin? "已连接" : "未连接"
                             color: "#AFC2D9"
                             font.pixelSize: 11
                             anchors.left: parent.left
