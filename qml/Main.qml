@@ -40,18 +40,15 @@ ApplicationWindow {
         antialiasing: true
 
         // 所有页面内容容器
-        Item {
+        RowLayout {
             id: contentContainer
             anchors.fill: parent
-            clip: false
-
+            spacing: 0
             // Left navigation 侧边栏
             Rectangle {
                 id: sidebar
-                width: 202
-                anchors.left: parent.left
-                anchors.top: parent.top
-                anchors.bottom: parent.bottom
+                Layout.preferredWidth: 202
+                Layout.fillHeight: true
                 color: "#111C2C"
                 // 只圆左边两个角
                 topLeftRadius: window.isMaximized ? 0 : window.windowCornerRadius    // 替换为变量
@@ -216,10 +213,8 @@ ApplicationWindow {
             // Main login area 主区域
             Rectangle {
                 id: mainArea
-                anchors.left: sidebar.right
-                anchors.right: parent.right
-                anchors.top: parent.top
-                anchors.bottom: parent.bottom
+                Layout.fillWidth: true
+                Layout.fillHeight: true
                 color: window.page
                 // 只圆右边两个角
                 topRightRadius: window.isMaximized ? 0 : window.windowCornerRadius    // 替换为变量
@@ -253,17 +248,12 @@ ApplicationWindow {
                             }
                             WindowButton {
                                 iconSource: window.visibility === Window.Maximized ? "qrc:/qt/qml/FileSync/assets/window-restore.svg" : "qrc:/qt/qml/FileSync/assets/window-maximize.svg"
-                                function show_from_spacing(spacing) {
-                                    login_panel_column.spacing = spacing;
-                                    select_login.transform = [Qt.createQmlObject("import QtQuick 2.15; Translate{}", select_login)];
-                                    select_login.transform[0].y = login_panel_column.spacing * 2;
-                                    select_login_border_bottom.transform = [Qt.createQmlObject("import QtQuick 2.15; Translate{}", select_login_border_bottom)];
-                                    select_login_border_bottom.transform[0].y = login_panel_column.spacing - 2;
-                                }
                                 onClicked: {
                                     if (window.visibility === Window.Maximized) {
+                                        sidebar.Layout.preferredWidth = 202
                                         window.showNormal();
                                     } else {
+                                        sidebar.Layout.preferredWidth = 302
                                         window.showMaximized();
                                     }
                                 }
