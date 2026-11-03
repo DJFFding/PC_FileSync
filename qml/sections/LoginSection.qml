@@ -271,7 +271,7 @@ Item {
 
                         Item {
                             width: 1
-                            height: 32
+                            height: maximized?32:16
                         }
                         // ============================================================
                         // 登录内容区域
@@ -280,7 +280,7 @@ Item {
                             id: login_content
 
                             width: parent.width
-                            height: accountField.accountError || phoneField.accountError ? 218 : 190
+                            height: maximized?200+3*registerFormViewport.error_height_inc:(accountField.accountError || phoneField.accountError) ? 200+registerFormViewport.error_height_inc : 200
 
                             Behavior on height {
                                 NumberAnimation {
@@ -329,11 +329,13 @@ Item {
 
                                 Column {
                                     width: parent.width
-                                    spacing: 14
+                                    spacing: 0
 
                                     Item {
                                         width: parent.width
-                                        height: accountField.accountError ? 82 : 54
+                                        height: accountField.accountError ?  registerFormViewport.normal_height
+                                                                                     + registerFormViewport.error_height_inc
+                                                                                   : registerFormViewport.normal_height
 
                                         Behavior on height {
                                             NumberAnimation {
@@ -357,6 +359,10 @@ Item {
                                             validateWhat: LoginField.ValidateWhat.Phone | LoginField.ValidateWhat.Email
                                         }
                                     }
+                                    Item {
+                                        width: 1
+                                        height: maximized?32:24
+                                    }
 
                                     // -------------------------
                                     // 密码
@@ -373,6 +379,10 @@ Item {
                                         password: true
                                     }
 
+                                    Item {
+                                        width: 1
+                                        height: maximized?40:32
+                                    }
                                     // -------------------------
                                     // 底部操作
                                     // -------------------------
@@ -491,14 +501,16 @@ Item {
 
                                 Column {
                                     width: parent.width
-                                    spacing: 14
+                                    spacing: 0
 
                                     // ------------------------------------------------
                                     // 手机号
                                     // ------------------------------------------------
                                     Item {
                                         width: parent.width
-                                        height: phoneField.accountError ? 82 : 54
+                                        height: phoneField.accountError ?  registerFormViewport.normal_height
+                                                                                     + registerFormViewport.error_height_inc
+                                                                                   : registerFormViewport.normal_height
 
                                         Behavior on height {
                                             NumberAnimation {
@@ -518,7 +530,10 @@ Item {
                                             validateWhat: LoginField.ValidateWhat.Phone
                                         }
                                     }
-
+                                    Item {
+                                        width: 1
+                                        height: maximized?32:24
+                                    }
                                     // ------------------------------------------------
                                     // 验证码
                                     // ------------------------------------------------
@@ -597,7 +612,10 @@ Item {
                                             }
                                         }
                                     }
-
+                                    Item {
+                                        width: 1
+                                        height: maximized?40:32
+                                    }
                                     // ------------------------------------------------
                                     // 底部操作
                                     // ------------------------------------------------
@@ -703,12 +721,14 @@ Item {
                                 }
                             }
                         }
-
+                        Item {
+                            width: 1
+                            height: maximized?32:16
+                        }
                         Button {
                             id: loginButton
                             width: parent.width
                             height: 50
-                            topPadding: 6
                             background: Rectangle {
                                 radius: 8
                                 color: loginButton.down ? root.primaryDarkColor : loginButton.hovered ? "#5878F7" : root.primaryColor
@@ -948,14 +968,16 @@ Item {
 
                         Item {
                             width: 1
-                            height: 16
+                            height: maximized?32:16
                         }
 
                         // 注册表单容器
                         Item {
                             id: registerFormViewport
                             width: parent.width
-                            height: 364
+                            height: maximized?468:364
+                            property int normal_height: maximized?70:50
+                            property int error_height_inc: 14
 
                             Item {
                                 id: accountRegisterPanel
@@ -986,16 +1008,18 @@ Item {
                                         easing.type: Easing.OutCubic
                                     }
                                 }
-                                ColumnLayout {
+
+                                Column {
                                     anchors.fill: parent
-                                    spacing: 0
 
+                                    spacing: 20
                                     Item {
-                                        Layout.fillWidth: true
-
-                                        height: registerUserNameField.accountError ? 82 : 50
-                                        Layout.preferredHeight: height
-
+                                        id: usernameItem
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        height: registerUserNameField.accountError ?  registerFormViewport.normal_height
+                                                                                     + registerFormViewport.error_height_inc
+                                                                                   : registerFormViewport.normal_height
                                         Behavior on height {
                                             NumberAnimation {
                                                 duration: 140
@@ -1019,15 +1043,13 @@ Item {
                                         }
                                     }
                                     Item {
-                                        Layout.fillWidth: true
-                                        Layout.fillHeight: true
-                                    }
+                                        id: registerEmailFieldItem
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
 
-                                    Item {
-                                        Layout.fillWidth: true
-
-                                        height: registerEmailField.accountError ? 82 : 50
-                                        Layout.preferredHeight: height
+                                        height: registerEmailField.accountError ?registerFormViewport.normal_height
+                                                                                  + registerFormViewport.error_height_inc
+                                                                                : registerFormViewport.normal_height
 
                                         Behavior on height {
                                             NumberAnimation {
@@ -1052,16 +1074,14 @@ Item {
                                             validateWhat: LoginField.ValidateWhat.Email
                                         }
                                     }
-                                    Item {
-                                        Layout.fillWidth: true
-                                        Layout.fillHeight: true
-                                    }
 
                                     Item {
-                                        Layout.fillWidth: true
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
 
-                                        height: registerEmailCodeField.accountError ? 82 : 50
-                                        Layout.preferredHeight: height
+                                        height: registerEmailCodeField.accountError ?registerFormViewport.normal_height
+                                                                                  + registerFormViewport.error_height_inc
+                                                                                : registerFormViewport.normal_height
 
                                         Behavior on height {
                                             NumberAnimation {
@@ -1150,14 +1170,12 @@ Item {
                                         }
                                     }
                                     Item {
-                                        Layout.fillWidth: true
-                                        Layout.fillHeight: true
-                                    }
-                                    Item {
-                                        Layout.fillWidth: true
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
 
-                                        height: registerAccountPasswordField.accountError ? 82 : 50
-                                        Layout.preferredHeight: height
+                                        height: registerAccountPasswordField.accountError ?registerFormViewport.normal_height
+                                                                                  + registerFormViewport.error_height_inc
+                                                                                : registerFormViewport.normal_height
 
                                         Behavior on height {
                                             NumberAnimation {
@@ -1182,16 +1200,13 @@ Item {
                                             validateWhat: LoginField.ValidateWhat.Password
                                         }
                                     }
-
                                     Item {
-                                        Layout.fillWidth: true
-                                        Layout.fillHeight: true
-                                    }
-                                    Item {
-                                        Layout.fillWidth: true
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
 
-                                        height: registerAccountConfirmPasswordField.accountError ? 82 : 50
-                                        Layout.preferredHeight: height
+                                        height: registerAccountConfirmPasswordField.accountError ?registerFormViewport.normal_height
+                                                                                  + registerFormViewport.error_height_inc
+                                                                                : registerFormViewport.normal_height
 
                                         Behavior on height {
                                             NumberAnimation {
@@ -1216,8 +1231,8 @@ Item {
                                             validateWhat: LoginField.ValidateWhat.RePassword
                                         }
                                     }
+                                    }
                                 }
-                            }
 
                             Item {
                                 id: phoneRegisterPanel
@@ -1248,15 +1263,16 @@ Item {
                                         easing.type: Easing.OutCubic
                                     }
                                 }
-                                ColumnLayout {
+                                Column {
                                     anchors.fill: parent
-                                    spacing: 0
+                                    spacing: 20
 
                                     Item {
-                                        Layout.fillWidth: true
-
-                                        height: registerPhoneField.accountError ? 82 : 50
-                                        Layout.preferredHeight: height
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        height: registerPhoneField.accountError ?  registerFormViewport.normal_height
+                                                                                     + registerFormViewport.error_height_inc
+                                                                                   : registerFormViewport.normal_height
 
                                         Behavior on height {
                                             NumberAnimation {
@@ -1280,14 +1296,11 @@ Item {
                                     }
 
                                     Item {
-                                        Layout.fillWidth: true
-                                        Layout.fillHeight: true
-                                    }
-                                    Item {
-                                        Layout.fillWidth: true
-
-                                        height: registerSmsCodeField.accountError ? 82 : 50
-                                        Layout.preferredHeight: height
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        height: registerSmsCodeField.accountError ?  registerFormViewport.normal_height
+                                                                                     + registerFormViewport.error_height_inc
+                                                                                   : registerFormViewport.normal_height
 
                                         Behavior on height {
                                             NumberAnimation {
@@ -1374,15 +1387,13 @@ Item {
                                             }
                                         }
                                     }
-                                    Item {
-                                        Layout.fillWidth: true
-                                        Layout.fillHeight: true
-                                    }
-                                    Item {
-                                        Layout.fillWidth: true
 
-                                        height: registerPhonePasswordField.accountError ? 82 : 50
-                                        Layout.preferredHeight: height
+                                    Item {
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        height: registerPhonePasswordField.accountError ?  registerFormViewport.normal_height
+                                                                                     + registerFormViewport.error_height_inc
+                                                                                   : registerFormViewport.normal_height
 
                                         Behavior on height {
                                             NumberAnimation {
@@ -1406,16 +1417,13 @@ Item {
                                             validateWhat: LoginField.ValidateWhat.Password
                                         }
                                     }
-                                    Item {
-                                        Layout.fillWidth: true
-                                        Layout.fillHeight: true
-                                    }
 
                                     Item {
-                                        Layout.fillWidth: true
-
-                                        height: registerPhoneConfirmPasswordField.accountError ? 82 : 50
-                                        Layout.preferredHeight: height
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        height: registerPhoneConfirmPasswordField.accountError ?  registerFormViewport.normal_height
+                                                                                     + registerFormViewport.error_height_inc
+                                                                                   : registerFormViewport.normal_height
 
                                         Behavior on height {
                                             NumberAnimation {
@@ -1438,10 +1446,6 @@ Item {
                                             validateAccount: true
                                             validateWhat: LoginField.ValidateWhat.RePassword
                                         }
-                                    }
-                                    Item {
-                                        Layout.fillWidth: true
-                                        Layout.fillHeight: true
                                     }
 
                                     Button {
