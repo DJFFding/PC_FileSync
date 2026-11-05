@@ -620,7 +620,7 @@ Item {
                                 ]
                                 delegate: Rectangle {
                                     Layout.fillWidth: true
-                                    Layout.fillHeight: true
+                                    Layout.preferredHeight: 76
                                     radius: 10
                                     color: "#FFFFFF"
                                     border.color: "#EDF1F7"
@@ -680,7 +680,6 @@ Item {
                             Layout.fillHeight: true
                             radius: 11
                             color: "#FFFFFF"
-                            border.color: "#E9EEF6"
                             clip: true
 
                             ColumnLayout {
@@ -765,7 +764,9 @@ Item {
                                     Layout.fillWidth: true
                                     height: 38
                                     Row {
-                                        anchors.fill: parent
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: parent.verticalCenter
                                         anchors.leftMargin: 16
                                         anchors.rightMargin: 13
                                         spacing: 0
@@ -994,6 +995,18 @@ Item {
                                     }
                                 }
                             }
+                            // ============================================================
+                            // 边框覆盖层：确保内部控件不会遮挡外边框
+                            // ============================================================
+                            Rectangle {
+                                anchors.fill: parent
+                                radius: parent.radius
+                                color: "transparent"
+                                border.width: 1
+                                border.color: "#E9EEF6"
+                                antialiasing: true
+                                z: 100
+                            }
                         }
                     }
                 }
@@ -1175,8 +1188,8 @@ Item {
                             contentItem: Row {
                                 anchors.centerIn: parent
                                 spacing: 8
-                                Text { text: "↓"; color: root.primaryColor; font.pixelSize: 16 }
-                                Text { text: "下载到本地"; color: "#53637D"; font.pixelSize: 11 }
+                                Text { anchors.verticalCenter:parent.verticalCenter;text: "↓"; color: root.primaryColor; font.pixelSize: 16 }
+                                Text { anchors.verticalCenter:parent.verticalCenter;text: "下载到本地"; color: "#53637D"; font.pixelSize: 11 }
                             }
                             onClicked: root.downloadRequested(root.selectedName)
                         }
@@ -1193,8 +1206,8 @@ Item {
                             contentItem: Row {
                                 anchors.centerIn: parent
                                 spacing: 8
-                                Text { text: "↗"; color: root.primaryColor; font.pixelSize: 15 }
-                                Text { text: "分享"; color: "#53637D"; font.pixelSize: 11 }
+                                Text { anchors.verticalCenter:parent.verticalCenter;text: "↗"; color: root.primaryColor; font.pixelSize: 15 }
+                                Text { anchors.verticalCenter:parent.verticalCenter;text: "分享"; color: "#53637D"; font.pixelSize: 11 }
                             }
                             onClicked: root.shareRequested(root.selectedName)
                         }
@@ -1211,13 +1224,13 @@ Item {
                             contentItem: Row {
                                 anchors.centerIn: parent
                                 spacing: 8
-                                Text { text: "⌫"; color: "#E47772"; font.pixelSize: 14 }
-                                Text { text: "删除"; color: "#D76D68"; font.pixelSize: 11 }
+                                Text { anchors.verticalCenter:parent.verticalCenter;text: "⌫"; color: "#E47772"; font.pixelSize: 14 }
+                                Text { anchors.verticalCenter:parent.verticalCenter;text: "删除"; color: "#D76D68"; font.pixelSize: 11 }
                             }
                             onClicked: root.deleteRequested(root.selectedName)
                         }
 
-                        Item { width: 1; height: 1; Layout.fillHeight: true }
+                        Item { width: 1; height: 8; }
 
                         Rectangle {
                             width: parent.width
