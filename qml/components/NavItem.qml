@@ -4,6 +4,9 @@ Item {
         property string label: ""
         property string icon: ""
         property bool selected: false
+
+        signal clicked()
+
         height: 48
 
         Rectangle {
@@ -38,5 +41,6 @@ Item {
             id: navMouse
             anchors.fill: parent
             hoverEnabled: true
+            onClicked: parent.clicked()
         }
     }

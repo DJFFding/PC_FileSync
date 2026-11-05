@@ -94,36 +94,49 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         spacing: 5
                         topPadding: 8
+                        property int currentIndex: 0
+
                         NavItem {
                             width: sidebar.width
                             label: "首页"
                             icon: "home"
-                            selected: true
+                            selected: parent.currentIndex === 0
+                            onClicked: main_area_stack.currentIndex = parent.currentIndex = 0
                         }
                         NavItem {
                             width: sidebar.width
                             label: "文件"
                             icon: "file"
+                            selected: parent.currentIndex === 1
+                            onClicked:main_area_stack.currentIndex = parent.currentIndex = 1
                         }
                         NavItem {
                             width: sidebar.width
                             label: "同步"
                             icon: "sync"
+                            selected: parent.currentIndex === 2
+                            onClicked: parent.currentIndex = 2
                         }
                         NavItem {
                             width: sidebar.width
                             label: "任务"
                             icon: "task"
+                            selected: parent.currentIndex === 3
+                            onClicked: parent.currentIndex = 3
                         }
                         NavItem {
                             width: sidebar.width
                             label: "历史"
                             icon: "history"
+                            selected: parent.currentIndex === 4
+                            onClicked: parent.currentIndex = 4
                         }
                         NavItem {
                             width: sidebar.width
                             label: "设置"
                             icon: "settings"
+                            selected: parent.currentIndex === 4
+                            onClicked: parent.currentIndex = 4
                         }
                     }
 
@@ -265,18 +278,27 @@ ApplicationWindow {
                             }
                         }
                     }
-                    LoginSection {
+                    StackLayout
+                    {
+                        id: main_area_stack
                         anchors.left: parent.left
                         anchors.right: parent.right
                         anchors.top: titleBar.bottom
                         anchors.bottom: parent.bottom
+                        currentIndex: 0
+                        LoginSection {
+                            primaryColor: window.primary
+                            primaryDarkColor: window.primaryDark
 
-                        primaryColor: window.primary
-                        primaryDarkColor: window.primaryDark
+                            maximized: window.visibility === Window.Maximized
+                            cornerRadius: window.windowCornerRadius
+                        }
 
-                        maximized: window.visibility === Window.Maximized
-                        cornerRadius: window.windowCornerRadius
+                        FileSection{
+                        }
                     }
+
+
                 }
             }
         }
