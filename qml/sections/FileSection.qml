@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import FileSyncComponents 1.0
 
 /*
  * FileSync - 文件工作台
@@ -8,8 +9,8 @@ import QtQuick.Layouts
  * 用法：
  *   FileManagerPage { anchors.fill: parent }
  *
- * 这是 UI 层示例。文件列表使用本地 ListModel 演示；上传、下载、分享、删除、
- * 新建文件夹、刷新和立即同步通过 signals 暴露，后续可在 C++ 中接入真实业务。
+ * 文件列表使用本地 ListModel；上传已通过 C++ UploadManager 接入本地 HTTP 测试服务。
+ * 下载、分享、删除、新建文件夹、刷新和立即同步仍通过 signals 暴露给业务层。
  */
 Item {
     id: root
@@ -52,6 +53,9 @@ Item {
     signal syncNowRequested()
     signal navigationChanged(string navigation)
     signal fileSelected(string fileName, string fileKind)
+
+    // 两个上传按钮共用独立的上传面板。
+    onUploadRequested: uploadDialog.open()
 
     function selectFile(name, kind, modified, size, status, ext) {
         selectedName = name
@@ -147,10 +151,12 @@ Item {
                     width: parent.width
                     height: 42
                     hoverEnabled: true
+                    enabled: !uploadManager.uploading
                     background: Rectangle {
                         radius: 8
-                        color: sidebarUploadButton.down ? root.primaryDarkColor
-                                                        : sidebarUploadButton.hovered ? "#5878F7" : root.primaryColor
+                        color: !sidebarUploadButton.enabled ? "#AAB8E8"
+                               : sidebarUploadButton.down ? root.primaryDarkColor
+                               : sidebarUploadButton.hovered ? "#5878F7" : root.primaryColor
                     }
                     contentItem: Row {
                         spacing: 8
@@ -580,10 +586,12 @@ Item {
                                 Layout.preferredWidth: 102
                                 Layout.preferredHeight: 36
                                 hoverEnabled: true
+                                enabled: !uploadManager.uploading
                                 background: Rectangle {
                                     radius: 8
-                                    color: uploadButton.down ? root.primaryDarkColor
-                                                             : uploadButton.hovered ? "#5878F7" : root.primaryColor
+                                    color: !uploadButton.enabled ? "#AAB8E8"
+                                           : uploadButton.down ? root.primaryDarkColor
+                                           : uploadButton.hovered ? "#5878F7" : root.primaryColor
                                 }
                                 contentItem: Row {
                                     anchors.centerIn: parent
@@ -1408,4 +1416,32 @@ Item {
             iconColor: "#E58A54"
         }
     }
+
+
+    // 上传交互独立封装，页面只负责打开弹窗和维护文件列表。
+    UploadDialog {
+        id: uploadDialog
+        anchors.centerIn: root
+        manager: uploadManager
+    }
+
+    Connections {
+        target: uploadManager
+
+        function onFileUploaded(fileName, displaySize, modifiedText) {
+            var dot = fileName.lastIndexOf(".")
+            var ext = dot >= 0 ? fileName.substring(dot + 1).toUpperCase() : "FILE"
+            fileModel.insert(0, {
+                name: fileName,
+                kind: "file",
+                ext: ext,
+                modified: modifiedText,
+                size: displaySize,
+                status: "已同步",
+                iconBg: "#EEF2FF",
+                iconColor: "#4B6EF5"
+            })
+        }
+    }
+
 }

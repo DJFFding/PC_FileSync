@@ -1,11 +1,13 @@
+#include "UploadManager.h"
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQuickStyle>
+#include <QQmlContext>
 
 int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
-
+    UploadManager uploadManager;
     QQuickStyle::setStyle(QStringLiteral("Basic"));
 
     QQmlApplicationEngine engine;
@@ -15,7 +17,10 @@ int main(int argc, char *argv[])
         &app,
         []() { QCoreApplication::exit(-1); },
         Qt::QueuedConnection);
-
+    engine.rootContext()->setContextProperty(
+        "uploadManager",
+        &uploadManager
+        );
     engine.loadFromModule("FileSync", "Main");
     return app.exec();
 }
