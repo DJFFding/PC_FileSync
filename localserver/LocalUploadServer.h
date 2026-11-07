@@ -11,6 +11,7 @@ class QUrl;
  * 仅用于本机联调的简易 HTTP 文件服务端。
  * 监听 127.0.0.1:8080：
  *   POST /upload      接收 multipart/form-data 文件并保存到程序目录/uploaded_files
+ *   POST /folders     接收 JSON { "name": "文件夹名称" }，在上传根目录新建文件夹
  *   GET  /files       递归返回 uploaded_files 中的文件和目录清单
  *   GET  /file?path=  返回指定文件内容，供 QML 图片/文本/文档预览使用
  *                      可选 offset/maxBytes 用于文本分块加载
@@ -31,6 +32,7 @@ private:
                         const QByteArray &body);
     void processFilesRequest(QTcpSocket *socket);
     void processFileRequest(QTcpSocket *socket, const QUrl &requestUrl);
+    void processCreateFolderRequest(QTcpSocket *socket, const QByteArray &body);
     void sendJson(QTcpSocket *socket, int statusCode,
                   const QByteArray &reason,
                   const QByteArray &jsonBody);

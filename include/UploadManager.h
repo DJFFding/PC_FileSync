@@ -13,6 +13,7 @@ class QUrl;
  * FileSync 文件上传/文件列表控制器。
  *
  * 上传协议：POST multipart/form-data，文件字段名为 file。
+ * 新建文件夹协议：POST /folders，JSON 请求体为 { "name": "文件夹名称" }。
  * 文件列表协议：GET /files，返回 JSON 中的 items 数组，或 files + directories 数组。
  */
 class UploadManager final : public QObject
@@ -22,6 +23,7 @@ class UploadManager final : public QObject
     Q_PROPERTY(QString fileListUrl READ fileListUrl WRITE setFileListUrl NOTIFY fileListUrlChanged)
     Q_PROPERTY(bool uploading READ uploading NOTIFY uploadingChanged)
     Q_PROPERTY(bool loadingFiles READ loadingFiles NOTIFY loadingFilesChanged)
+    Q_PROPERTY(bool creatingFolder READ creatingFolder NOTIFY creatingFolderChanged)
     Q_PROPERTY(int progress READ progress NOTIFY progressChanged)
     Q_PROPERTY(QString currentFile READ currentFile NOTIFY currentFileChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
@@ -42,6 +44,7 @@ public:
 
     bool uploading() const;
     bool loadingFiles() const;
+    bool creatingFolder() const;
     int progress() const;
     QString currentFile() const;
     QString statusText() const;
@@ -56,6 +59,9 @@ public:
 
     // 启动时或刷新时，从服务器重新获取全部文件及目录。
     Q_INVOKABLE void loadFiles();
+
+    // 在当前文件列表接口同级创建 /folders 请求，在文件根目录新建一个文件夹。
+    Q_INVOKABLE void createFolder(const QString &folderName);
 
     // 将列表中的相对路径转换为可供 QML Image 使用的文件内容 URL。
     Q_INVOKABLE QString fileContentUrl(const QString &path) const;
@@ -77,6 +83,7 @@ signals:
     void fileListUrlChanged();
     void uploadingChanged();
     void loadingFilesChanged();
+    void creatingFolderChanged();
     void progressChanged();
     void currentFileChanged();
     void statusTextChanged();
@@ -90,6 +97,11 @@ signals:
     // 并透传服务端提供的 previewType（image/text/binary）和 mimeType。
     void filesLoaded(const QVariantList &items);
     void filesLoadFailed(const QString &reason);
+
+    void folderCreated(const QString &folderName,
+                       const QString &folderPath,
+                       const QString &modifiedText);
+    void folderCreationFailed(const QString &folderName, const QString &reason);
 
     void pdfPreviewReady(int requestId, const QString &localUrl, int pageCount);
     void docxPreviewReady(int requestId, const QString &html);
@@ -119,6 +131,7 @@ private:
 
     void setUploading(bool value);
     void setLoadingFiles(bool value);
+    void setCreatingFolder(bool value);
     void setProgress(int value);
     void setCurrentFile(const QString &value);
     void setStatusText(const QString &value);
@@ -133,6 +146,7 @@ private:
     QQueue<UploadTask> m_queue;
     QNetworkReply *m_reply = nullptr;
     QNetworkReply *m_listReply = nullptr;
+    QNetworkReply *m_folderReply = nullptr;
     QNetworkReply *m_documentReply = nullptr;
     QTemporaryFile *m_documentFile = nullptr;
     UploadTask m_currentTask;
@@ -147,6 +161,7 @@ private:
     QString m_listStatus;
     bool m_uploading = false;
     bool m_loadingFiles = false;
+    bool m_creatingFolder = false;
     int m_progress = 0;
     int m_completedCount = 0;
     int m_totalCount = 0;

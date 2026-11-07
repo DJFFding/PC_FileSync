@@ -9,8 +9,8 @@ import FileSyncComponents 1.0
  * 用法：
  *   FileManagerPage { anchors.fill: parent }
  *
- * 文件列表使用本地 ListModel；上传已通过 C++ UploadManager 接入本地 HTTP 测试服务。
- * 下载、分享、删除、新建文件夹、刷新和立即同步仍通过 signals 暴露给业务层。
+ * 文件列表使用本地 ListModel；上传和新建文件夹已通过 C++ UploadManager 接入本地 HTTP 测试服务。
+ * 下载、分享、删除、刷新和立即同步仍通过 signals 暴露给业务层。
  */
 Item {
     id: root
@@ -46,6 +46,9 @@ Item {
     property string selectedSize: "18 个文件"
     property string selectedStatus: "已同步"
     property string selectedExt: "文件夹"
+    property string pendingCreatedFolderName: ""
+    property string pendingCreatedFolderPath: ""
+    property bool refreshAfterCurrentFileLoad: false
 
     // 供 C++ 业务层连接的接口
     signal uploadRequested()
@@ -61,8 +64,9 @@ Item {
     signal navigationChanged(string navigation)
     signal fileSelected(string fileName, string fileKind)
 
-    // 两个上传按钮共用独立的上传面板。
+    // 两个上传按钮共用独立的上传面板；新建文件夹沿用同样的异步请求模式。
     onUploadRequested: uploadDialog.open()
+    onCreateFolderRequested: uploadManager.createFolder(folderName)
 
     function selectFile(name, kind, modified, size, status, ext) {
         selectedName = name
@@ -84,6 +88,36 @@ Item {
 
     function matchesSearch(name) {
         return searchKeyword.length === 0 || name.toLowerCase().indexOf(searchKeyword.toLowerCase()) !== -1
+    }
+
+    // 与客户端和服务端保持一致，提前给出名称错误，服务端仍会进行最终校验。
+    function validateFolderName(folderName) {
+        var name = folderName === undefined || folderName === null ? "" : folderName.toString().trim()
+        if (name.length === 0)
+            return "请输入文件夹名称"
+        if (name.length > 100)
+            return "文件夹名称不能超过 100 个字符"
+        if (name === "." || name === "..")
+            return "文件夹名称不能是“.”或“..”"
+
+        var invalidCharacters = "<>:\"/\\|?*"
+        for (var i = 0; i < name.length; ++i) {
+            if (name.charCodeAt(i) < 32 || invalidCharacters.indexOf(name.charAt(i)) !== -1)
+                return "名称不能包含 < > : \" / \\ | ? * 或控制字符"
+        }
+        if (name.charAt(name.length - 1) === "." || name.charAt(name.length - 1) === " ")
+            return "文件夹名称不能以句点或空格结尾"
+
+        var baseName = name
+        var firstDot = baseName.indexOf(".")
+        if (firstDot > 0)
+            baseName = baseName.substring(0, firstDot)
+        baseName = baseName.toUpperCase()
+        if (["CON", "PRN", "AUX", "NUL"].indexOf(baseName) !== -1
+                || /^(COM|LPT)[1-9]$/.test(baseName))
+            return "该名称是系统保留名称，请更换文件夹名称"
+
+        return ""
     }
 
     function isImageExtension(extension) {
@@ -769,7 +803,7 @@ Item {
                                         font.weight: Font.DemiBold
                                     }
                                     Text {
-                                        text: "8 个项目"
+                                        text: fileListView.count + " 个项目"
                                         color: "#A7B2C2"
                                         font.pixelSize: 10
                                     }
@@ -1154,17 +1188,19 @@ Item {
                                                 }
                                             }
                                             Button {
+                                                id: rowMenuButton
                                                 width: 33
                                                 height: 32
                                                 anchors.verticalCenter: parent.verticalCenter
                                                 hoverEnabled: true
                                                 background: Rectangle {
                                                     radius: 6
-                                                    color: parent.hovered ? "#EEF2FA" : "transparent"
+                                                    color: rowMenuButton.down || rowMenu.opened ? "#E4EBFF"
+                                                           : rowMenuButton.hovered ? "#EEF2FA" : "transparent"
                                                 }
                                                 contentItem: Text {
                                                     text: "⋯"
-                                                    color: "#9AA6B8"
+                                                    color: rowMenu.opened ? root.primaryColor : "#9AA6B8"
                                                     font.pixelSize: 18
                                                     horizontalAlignment: Text.AlignHCenter
                                                     verticalAlignment: Text.AlignVCenter
@@ -1172,7 +1208,10 @@ Item {
                                                 onClicked: {
                                                     root.selectFile(name, kind, modified, size, status, ext)
                                                     rowMenu.fileName = name
-                                                    rowMenu.open()
+                                                    rowMenu.fileKind = kind
+                                                    rowMenu.popup(rowMenuButton,
+                                                                  rowMenuButton.width - rowMenu.width,
+                                                                  rowMenuButton.height + 6)
                                                 }
                                             }
                                         }
@@ -1769,22 +1808,421 @@ Item {
     }
 
     // ============================================================
-    // 文件右键/更多操作菜单
+    // 文件行“更多操作”菜单：当前仅定义 UI，不连接菜单业务操作。
     // ============================================================
     Menu {
         id: rowMenu
+
         property string fileName: ""
-        MenuItem {
-            text: "下载"
-            onTriggered: root.downloadRequested(rowMenu.fileName)
+        property string fileKind: ""
+
+        width: 220
+        padding: 6
+        modal: false
+        focus: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        transformOrigin: Item.TopRight
+
+        background: Rectangle {
+            color: "#FFFFFF"
+            radius: 12
+            border.width: 1
+            border.color: "#E4EAF4"
+            antialiasing: true
         }
+
+        enter: Transition {
+            NumberAnimation {
+                property: "opacity"
+                from: 0.0
+                to: 1.0
+                duration: 120
+                easing.type: Easing.OutCubic
+            }
+            NumberAnimation {
+                property: "scale"
+                from: 0.96
+                to: 1.0
+                duration: 120
+                easing.type: Easing.OutCubic
+            }
+        }
+        exit: Transition {
+            NumberAnimation {
+                properties: "opacity"
+                from: 1.0
+                to: 0.0
+                duration: 90
+            }
+        }
+
+        // 菜单标题：显示当前行文件名，不响应点击。
         MenuItem {
+            id: menuHeader
+            enabled: false
+            hoverEnabled: false
+            implicitHeight: 51
+            leftPadding: 10
+            rightPadding: 10
+            topPadding: 7
+            bottomPadding: 7
+            indicator: null
+            background: Item {}
+
+            contentItem: Column {
+                spacing: 3
+
+                Text {
+                    text: "文件操作"
+                    color: "#8B98AD"
+                    font.pixelSize: 10
+                    font.weight: Font.DemiBold
+                }
+                Text {
+                    width: parent.width
+                    text: rowMenu.fileName.length > 0 ? rowMenu.fileName : "当前文件"
+                    color: root.textDarkColor
+                    font.pixelSize: 12
+                    font.weight: Font.Medium
+                    elide: Text.ElideMiddle
+                }
+            }
+        }
+
+        MenuSeparator {
+            topPadding: 2
+            bottomPadding: 5
+            contentItem: Rectangle {
+                implicitHeight: 1
+                color: "#EDF1F6"
+            }
+        }
+
+        MenuItem {
+            id: openMenuItem
+            text: rowMenu.fileKind === "folder" ? "打开文件夹" : "打开文件"
+            implicitHeight: 40
+            hoverEnabled: true
+            leftPadding: 6
+            rightPadding: 10
+            topPadding: 4
+            bottomPadding: 4
+            indicator: null
+
+            background: Rectangle {
+                radius: 8
+                color: openMenuItem.down ? "#E5EBFF"
+                       : openMenuItem.hovered ? "#F1F4FF" : "transparent"
+            }
+            contentItem: RowLayout {
+                spacing: 10
+
+                Rectangle {
+                    Layout.preferredWidth: 29
+                    Layout.preferredHeight: 29
+                    radius: 7
+                    color: rowMenu.fileKind === "folder" ? "#FFF4E2" : "#EEF2FF"
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: rowMenu.fileKind === "folder" ? "▰" : "↗"
+                        color: rowMenu.fileKind === "folder" ? "#E2A345" : root.primaryColor
+                        font.pixelSize: 14
+                        font.weight: Font.DemiBold
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: openMenuItem.text
+                    color: "#40516B"
+                    font.pixelSize: 12
+                    font.weight: openMenuItem.hovered ? Font.Medium : Font.Normal
+                    elide: Text.ElideRight
+                }
+            }
+        }
+
+        MenuItem {
+            id: downloadMenuItem
+            text: "下载到本地"
+            implicitHeight: 40
+            hoverEnabled: true
+            leftPadding: 6
+            rightPadding: 10
+            topPadding: 4
+            bottomPadding: 4
+            indicator: null
+
+            background: Rectangle {
+                radius: 8
+                color: downloadMenuItem.down ? "#E5EBFF"
+                       : downloadMenuItem.hovered ? "#F1F4FF" : "transparent"
+            }
+            contentItem: RowLayout {
+                spacing: 10
+
+                Rectangle {
+                    Layout.preferredWidth: 29
+                    Layout.preferredHeight: 29
+                    radius: 7
+                    color: "#EEF2FF"
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "↓"
+                        color: root.primaryColor
+                        font.pixelSize: 17
+                        font.weight: Font.DemiBold
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: downloadMenuItem.text
+                    color: "#40516B"
+                    font.pixelSize: 12
+                    font.weight: downloadMenuItem.hovered ? Font.Medium : Font.Normal
+                    elide: Text.ElideRight
+                }
+            }
+        }
+
+        MenuItem {
+            id: shareMenuItem
             text: "分享"
-            onTriggered: root.shareRequested(rowMenu.fileName)
+            implicitHeight: 40
+            hoverEnabled: true
+            leftPadding: 6
+            rightPadding: 10
+            topPadding: 4
+            bottomPadding: 4
+            indicator: null
+
+            background: Rectangle {
+                radius: 8
+                color: shareMenuItem.down ? "#E5EBFF"
+                       : shareMenuItem.hovered ? "#F1F4FF" : "transparent"
+            }
+            contentItem: RowLayout {
+                spacing: 10
+
+                Rectangle {
+                    Layout.preferredWidth: 29
+                    Layout.preferredHeight: 29
+                    radius: 7
+                    color: "#EEF2FF"
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "↗"
+                        color: root.primaryColor
+                        font.pixelSize: 15
+                        font.weight: Font.DemiBold
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: shareMenuItem.text
+                    color: "#40516B"
+                    font.pixelSize: 12
+                    font.weight: shareMenuItem.hovered ? Font.Medium : Font.Normal
+                    elide: Text.ElideRight
+                }
+            }
         }
+
+        MenuSeparator {
+            topPadding: 5
+            bottomPadding: 5
+            contentItem: Rectangle {
+                implicitHeight: 1
+                color: "#EDF1F6"
+            }
+        }
+
         MenuItem {
+            id: renameMenuItem
+            text: "重命名"
+            implicitHeight: 40
+            hoverEnabled: true
+            leftPadding: 6
+            rightPadding: 10
+            topPadding: 4
+            bottomPadding: 4
+            indicator: null
+
+            background: Rectangle {
+                radius: 8
+                color: renameMenuItem.down ? "#E9EEF7"
+                       : renameMenuItem.hovered ? "#F5F7FB" : "transparent"
+            }
+            contentItem: RowLayout {
+                spacing: 10
+
+                Rectangle {
+                    Layout.preferredWidth: 29
+                    Layout.preferredHeight: 29
+                    radius: 7
+                    color: "#F2F5F9"
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "✎"
+                        color: "#71809B"
+                        font.pixelSize: 15
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: renameMenuItem.text
+                    color: "#40516B"
+                    font.pixelSize: 12
+                    font.weight: renameMenuItem.hovered ? Font.Medium : Font.Normal
+                    elide: Text.ElideRight
+                }
+            }
+        }
+
+        MenuItem {
+            id: moveMenuItem
+            text: "移动到"
+            implicitHeight: 40
+            hoverEnabled: true
+            leftPadding: 6
+            rightPadding: 10
+            topPadding: 4
+            bottomPadding: 4
+            indicator: null
+
+            background: Rectangle {
+                radius: 8
+                color: moveMenuItem.down ? "#E9EEF7"
+                       : moveMenuItem.hovered ? "#F5F7FB" : "transparent"
+            }
+            contentItem: RowLayout {
+                spacing: 10
+
+                Rectangle {
+                    Layout.preferredWidth: 29
+                    Layout.preferredHeight: 29
+                    radius: 7
+                    color: "#F2F5F9"
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "→"
+                        color: "#71809B"
+                        font.pixelSize: 16
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: moveMenuItem.text
+                    color: "#40516B"
+                    font.pixelSize: 12
+                    font.weight: moveMenuItem.hovered ? Font.Medium : Font.Normal
+                    elide: Text.ElideRight
+                }
+                Text {
+                    text: "›"
+                    color: "#B0BACA"
+                    font.pixelSize: 16
+                }
+            }
+        }
+
+        MenuItem {
+            id: favoriteMenuItem
+            text: "添加到收藏"
+            implicitHeight: 40
+            hoverEnabled: true
+            leftPadding: 6
+            rightPadding: 10
+            topPadding: 4
+            bottomPadding: 4
+            indicator: null
+
+            background: Rectangle {
+                radius: 8
+                color: favoriteMenuItem.down ? "#E9EEF7"
+                       : favoriteMenuItem.hovered ? "#F5F7FB" : "transparent"
+            }
+            contentItem: RowLayout {
+                spacing: 10
+
+                Rectangle {
+                    Layout.preferredWidth: 29
+                    Layout.preferredHeight: 29
+                    radius: 7
+                    color: "#F2F5F9"
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "☆"
+                        color: "#71809B"
+                        font.pixelSize: 17
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: favoriteMenuItem.text
+                    color: "#40516B"
+                    font.pixelSize: 12
+                    font.weight: favoriteMenuItem.hovered ? Font.Medium : Font.Normal
+                    elide: Text.ElideRight
+                }
+            }
+        }
+
+        MenuSeparator {
+            topPadding: 5
+            bottomPadding: 5
+            contentItem: Rectangle {
+                implicitHeight: 1
+                color: "#EDF1F6"
+            }
+        }
+
+        MenuItem {
+            id: deleteMenuItem
             text: "删除"
-            onTriggered: root.deleteRequested(rowMenu.fileName)
+            implicitHeight: 40
+            hoverEnabled: true
+            leftPadding: 6
+            rightPadding: 10
+            topPadding: 4
+            bottomPadding: 4
+            indicator: null
+
+            background: Rectangle {
+                radius: 8
+                color: deleteMenuItem.down ? "#FCE7E5"
+                       : deleteMenuItem.hovered ? "#FFF3F2" : "transparent"
+            }
+            contentItem: RowLayout {
+                spacing: 10
+
+                Rectangle {
+                    Layout.preferredWidth: 29
+                    Layout.preferredHeight: 29
+                    radius: 7
+                    color: deleteMenuItem.hovered ? "#FCE6E4" : "#FFF1F0"
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "⌫"
+                        color: "#DC716C"
+                        font.pixelSize: 15
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: deleteMenuItem.text
+                    color: "#D76561"
+                    font.pixelSize: 12
+                    font.weight: deleteMenuItem.hovered ? Font.Medium : Font.Normal
+                    elide: Text.ElideRight
+                }
+            }
         }
     }
 
@@ -1877,6 +2315,210 @@ Item {
     }
 
 
+    // 新建文件夹弹窗：名称校验、异步状态和错误提示均在当前操作上下文中完成。
+    Dialog {
+        id: createFolderDialog
+        anchors.centerIn: parent
+        width: 400
+        height: 282
+        padding: 0
+        modal: true
+        focus: true
+        closePolicy: uploadManager.creatingFolder ? Popup.NoAutoClose : Popup.CloseOnEscape
+
+        property string errorText: ""
+
+        function submit() {
+            if (uploadManager.creatingFolder)
+                return
+
+            var folderName = folderNameField.text.trim()
+            var validationError = root.validateFolderName(folderName)
+            if (validationError.length > 0) {
+                errorText = validationError
+                folderNameField.forceActiveFocus()
+                return
+            }
+
+            errorText = ""
+            root.createFolderRequested(folderName)
+        }
+
+        onOpened: {
+            folderNameField.text = "新建文件夹"
+            errorText = ""
+            folderNameField.forceActiveFocus()
+            folderNameField.selectAll()
+        }
+
+        Overlay.modal: Rectangle {
+            color: "#66000000"
+        }
+
+        background: Rectangle {
+            color: "#FFFFFF"
+            radius: 13
+            border.width: 1
+            border.color: "#E4EAF4"
+            antialiasing: true
+        }
+
+        contentItem: Item {
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 22
+                spacing: 11
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 30
+                    spacing: 10
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: "新建文件夹"
+                        color: root.textDarkColor
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        verticalAlignment: Text.AlignVCenter
+                    }
+
+                    Button {
+                        id: folderDialogCloseButton
+                        Layout.preferredWidth: 28
+                        Layout.preferredHeight: 28
+                        enabled: !uploadManager.creatingFolder
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 6
+                            color: folderDialogCloseButton.hovered ? "#F2F5FA" : "transparent"
+                        }
+                        contentItem: Text {
+                            text: "×"
+                            color: folderDialogCloseButton.enabled ? "#8D9AB0" : "#C8CFDA"
+                            font.pixelSize: 19
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onClicked: createFolderDialog.close()
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: "将在“我的文件”中创建一个空文件夹。"
+                    color: root.textMidColor
+                    font.pixelSize: 11
+                    elide: Text.ElideRight
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 42
+                    radius: 8
+                    color: folderNameField.activeFocus ? "#FAFBFF" : "#FFFFFF"
+                    border.width: 1
+                    border.color: createFolderDialog.errorText.length > 0 ? "#DF827C"
+                                  : (folderNameField.activeFocus ? root.primaryColor : "#DDE5F2")
+
+                    TextField {
+                        id: folderNameField
+                        anchors.fill: parent
+                        anchors.leftMargin: 12
+                        anchors.rightMargin: 12
+                        color: root.textDarkColor
+                        font.pixelSize: 12
+                        selectByMouse: true
+                        selectedTextColor: "#FFFFFF"
+                        selectionColor: root.primaryColor
+                        verticalAlignment: TextInput.AlignVCenter
+                        background: Item {}
+                        onTextChanged: createFolderDialog.errorText = ""
+                        onAccepted: createFolderDialog.submit()
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 34
+                    text: createFolderDialog.errorText.length > 0
+                          ? createFolderDialog.errorText
+                          : "名称需符合系统文件命名规则，最多 100 个字符。"
+                    color: createFolderDialog.errorText.length > 0 ? "#D76D68" : "#9AA6B8"
+                    font.pixelSize: 10
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignTop
+                }
+
+                Item { Layout.fillHeight: true }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 36
+                    spacing: 9
+
+                    Item { Layout.fillWidth: true }
+
+                    Button {
+                        id: cancelCreateFolderButton
+                        Layout.preferredWidth: 76
+                        Layout.preferredHeight: 36
+                        enabled: !uploadManager.creatingFolder
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 8
+                            color: cancelCreateFolderButton.hovered ? "#F4F6FA" : "#FFFFFF"
+                            border.color: "#DFE6F1"
+                        }
+                        contentItem: Text {
+                            text: "取消"
+                            color: cancelCreateFolderButton.enabled ? "#596981" : "#A7B2C2"
+                            font.pixelSize: 11
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onClicked: createFolderDialog.close()
+                    }
+
+                    Button {
+                        id: confirmCreateFolderButton
+                        Layout.preferredWidth: 76
+                        Layout.preferredHeight: 36
+                        enabled: !uploadManager.creatingFolder
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 8
+                            color: !confirmCreateFolderButton.enabled ? "#AAB8E8"
+                                   : confirmCreateFolderButton.down ? root.primaryDarkColor
+                                   : confirmCreateFolderButton.hovered ? "#5878F7" : root.primaryColor
+                        }
+                        contentItem: Row {
+                            anchors.centerIn: parent
+                            spacing: 6
+
+                            BusyIndicator {
+                                width: 16
+                                height: 16
+                                anchors.verticalCenter: parent.verticalCenter
+                                running: uploadManager.creatingFolder
+                                visible: running
+                            }
+                            Text {
+                                text: uploadManager.creatingFolder ? "创建中…" : "创建"
+                                color: "#FFFFFF"
+                                font.pixelSize: 11
+                                font.weight: Font.DemiBold
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.horizontalCenter: parent.horizontalCenter
+                            }
+                        }
+                        onClicked: createFolderDialog.submit()
+                    }
+                }
+            }
+        }
+    }
+
     // 上传交互独立封装，页面只负责打开弹窗和维护文件列表。
     UploadDialog {
         id: uploadDialog
@@ -1894,6 +2536,53 @@ Item {
             for (var i = 0; i < items.length; ++i) {
                 fileModel.append(items[i])
             }
+
+            // 新建完成后以服务器列表为准，并选中新文件夹，保持上传后的交互反馈一致。
+            var foundCreatedFolder = false
+            var shouldReloadAfterCurrentLoad = root.refreshAfterCurrentFileLoad
+            if (root.pendingCreatedFolderName.length > 0) {
+                for (var j = 0; j < fileModel.count; ++j) {
+                    var item = fileModel.get(j)
+                    var itemPath = item.path === undefined || item.path === null ? "" : item.path.toString()
+                    var pathMatches = root.pendingCreatedFolderPath.length > 0
+                                      ? itemPath === root.pendingCreatedFolderPath
+                                      : item.name === root.pendingCreatedFolderName
+                    if (item.kind === "folder" && pathMatches) {
+                        root.selectFile(item.name, item.kind, item.modified, item.size,
+                                        item.status, item.ext)
+                        foundCreatedFolder = true
+                        break
+                    }
+                }
+
+                // 如果当前响应可能创建于新文件夹之前，则保留选中信息，等待补发的新请求。
+                if (foundCreatedFolder || !shouldReloadAfterCurrentLoad) {
+                    root.pendingCreatedFolderName = ""
+                    root.pendingCreatedFolderPath = ""
+                }
+            }
+
+            // loadFiles() 在加载中会直接返回；旧请求结束后补发一次，避免旧列表覆盖创建结果。
+            if (shouldReloadAfterCurrentLoad) {
+                root.refreshAfterCurrentFileLoad = false
+                if (!foundCreatedFolder)
+                    uploadManager.loadFiles()
+            }
+        }
+
+        function onFolderCreated(folderName, folderPath, modifiedText) {
+            root.pendingCreatedFolderName = folderName
+            root.pendingCreatedFolderPath = folderPath
+            root.refreshAfterCurrentFileLoad = uploadManager.loadingFiles
+            createFolderDialog.errorText = ""
+            createFolderDialog.close()
+            uploadManager.loadFiles()
+        }
+
+        function onFolderCreationFailed(folderName, reason) {
+            createFolderDialog.errorText = reason
+            folderNameField.forceActiveFocus()
+            folderNameField.selectAll()
         }
 
         // 单个文件上传成功
@@ -1941,6 +2630,10 @@ Item {
 
         function onFilesLoadFailed(reason) {
             console.warn("加载文件列表失败：" + reason)
+            if (root.refreshAfterCurrentFileLoad) {
+                root.refreshAfterCurrentFileLoad = false
+                uploadManager.loadFiles()
+            }
         }
     }
     Component.onCompleted: {

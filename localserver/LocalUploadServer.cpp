@@ -9,6 +9,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonParseError>
 #include <QMimeDatabase>
 #include <QMimeType>
 #include <QRegularExpression>
@@ -26,6 +27,58 @@ QString uploadedFilesPath()
 {
     return QDir(QCoreApplication::applicationDirPath())
         .filePath(QStringLiteral("uploaded_files"));
+}
+
+bool validateFolderName(const QString &folderName, QString *error)
+{
+    if (folderName.isEmpty()) {
+        *error = QStringLiteral("请输入文件夹名称");
+        return false;
+    }
+    if (folderName.size() > 100) {
+        *error = QStringLiteral("文件夹名称不能超过 100 个字符");
+        return false;
+    }
+    if (folderName == QStringLiteral(".") || folderName == QStringLiteral("..")) {
+        *error = QStringLiteral("文件夹名称不能是“.”或“..”");
+        return false;
+    }
+
+    const QString invalidCharacters = QStringLiteral("<>:\"/\\|?*");
+    for (const QChar ch : folderName) {
+        if (ch.unicode() < 32 || invalidCharacters.contains(ch)) {
+            *error = QStringLiteral("名称不能包含 < > : \" / \\ | ? * 或控制字符");
+            return false;
+        }
+    }
+
+    // 使用单目录名称并限制跨平台非法字符，不能借该接口创建嵌套路径。
+    if (folderName.endsWith(QLatin1Char('.')) || folderName.endsWith(QLatin1Char(' '))) {
+        *error = QStringLiteral("文件夹名称不能以句点或空格结尾");
+        return false;
+    }
+
+    QString baseName = folderName;
+    const int firstDot = baseName.indexOf(QLatin1Char('.'));
+    if (firstDot > 0)
+        baseName = baseName.left(firstDot);
+    baseName = baseName.toUpper();
+
+    const bool reservedDeviceName = baseName == QStringLiteral("CON")
+                                    || baseName == QStringLiteral("PRN")
+                                    || baseName == QStringLiteral("AUX")
+                                    || baseName == QStringLiteral("NUL")
+                                    || ((baseName.startsWith(QStringLiteral("COM"))
+                                         || baseName.startsWith(QStringLiteral("LPT")))
+                                        && baseName.size() == 4
+                                        && baseName.at(3) >= QLatin1Char('1')
+                                        && baseName.at(3) <= QLatin1Char('9'));
+    if (reservedDeviceName) {
+        *error = QStringLiteral("该名称是系统保留名称，请更换文件夹名称");
+        return false;
+    }
+
+    return true;
 }
 
 QString formatFileSize(qint64 bytes)
@@ -274,6 +327,8 @@ bool LocalUploadServer::listen(quint16 port)
                           << QStringLiteral("http://127.0.0.1:%1/upload").arg(m_server.serverPort());
         qInfo().noquote() << QStringLiteral("文件列表接口：")
                           << QStringLiteral("http://127.0.0.1:%1/files").arg(m_server.serverPort());
+        qInfo().noquote() << QStringLiteral("新建文件夹接口：")
+                          << QStringLiteral("http://127.0.0.1:%1/folders").arg(m_server.serverPort());
         qInfo().noquote() << QStringLiteral("上传目录：%1").arg(uploadedFilesPath());
     } else {
         qCritical().noquote() << QStringLiteral("监听失败：%1").arg(m_server.errorString());
@@ -324,12 +379,15 @@ void LocalUploadServer::readRequest(QTcpSocket *socket)
         return;
     }
 
-    // 当前测试服务只支持 POST /upload、GET /files 和 GET /file。
-    if (method != QByteArrayLiteral("POST") || requestPath != QStringLiteral("/upload")) {
+    const bool isUploadRequest = method == QByteArrayLiteral("POST")
+                                 && requestPath == QStringLiteral("/upload");
+    const bool isCreateFolderRequest = method == QByteArrayLiteral("POST")
+                                       && requestPath == QStringLiteral("/folders");
+    if (!isUploadRequest && !isCreateFolderRequest) {
         sendJson(socket, 404, QByteArrayLiteral("Not Found"),
                  QJsonDocument(QJsonObject{
                      {QStringLiteral("success"), false},
-                     {QStringLiteral("message"), QStringLiteral("接口不存在，请使用 GET /files、GET /file 或 POST /upload")}
+                     {QStringLiteral("message"), QStringLiteral("接口不存在，请使用 GET /files、GET /file、POST /upload 或 POST /folders")}
                  }).toJson(QJsonDocument::Compact));
         return;
     }
@@ -354,7 +412,15 @@ void LocalUploadServer::readRequest(QTcpSocket *socket)
         sendJson(socket, 413, QByteArrayLiteral("Payload Too Large"),
                  QJsonDocument(QJsonObject{
                      {QStringLiteral("success"), false},
-                     {QStringLiteral("message"), QStringLiteral("测试服务端仅允许 512 MB 以内的文件")}
+                     {QStringLiteral("message"), QStringLiteral("测试服务端仅允许 512 MB 以内的请求体")}
+                 }).toJson(QJsonDocument::Compact));
+        return;
+    }
+    if (isCreateFolderRequest && contentLength > 64 * 1024) {
+        sendJson(socket, 413, QByteArrayLiteral("Payload Too Large"),
+                 QJsonDocument(QJsonObject{
+                     {QStringLiteral("success"), false},
+                     {QStringLiteral("message"), QStringLiteral("新建文件夹请求体不能超过 64 KB")}
                  }).toJson(QJsonDocument::Compact));
         return;
     }
@@ -365,6 +431,10 @@ void LocalUploadServer::readRequest(QTcpSocket *socket)
 
     const QByteArray body = buffer.mid(static_cast<int>(bodyStart),
                                        static_cast<int>(contentLength));
+    if (isCreateFolderRequest) {
+        processCreateFolderRequest(socket, body);
+        return;
+    }
     processRequest(socket, headerBlock, body);
 }
 
@@ -566,6 +636,105 @@ void LocalUploadServer::processFileRequest(QTcpSocket *socket, const QUrl &reque
     }
     socket->flush();
     socket->disconnectFromHost();
+}
+
+void LocalUploadServer::processCreateFolderRequest(QTcpSocket *socket,
+                                                   const QByteArray &body)
+{
+    auto sendError = [this, socket](int statusCode, const QByteArray &reason,
+                                    const QString &message) {
+        sendJson(socket, statusCode, reason,
+                 QJsonDocument(QJsonObject{
+                     {QStringLiteral("success"), false},
+                     {QStringLiteral("message"), message}
+                 }).toJson(QJsonDocument::Compact));
+    };
+
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(body, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        sendError(400, QByteArrayLiteral("Bad Request"),
+                  QStringLiteral("请求体不是有效的 JSON 对象"));
+        return;
+    }
+
+    const QString folderName = document.object().value(QStringLiteral("name"))
+                               .toString().trimmed();
+    QString validationError;
+    if (!validateFolderName(folderName, &validationError)) {
+        sendError(400, QByteArrayLiteral("Bad Request"), validationError);
+        return;
+    }
+
+    QDir rootDir(uploadedFilesPath());
+    if (!rootDir.exists()) {
+        QDir appDir(QCoreApplication::applicationDirPath());
+        if (!appDir.mkpath(QStringLiteral("uploaded_files"))) {
+            sendError(500, QByteArrayLiteral("Internal Server Error"),
+                      QStringLiteral("无法创建文件存储目录"));
+            return;
+        }
+        rootDir = QDir(uploadedFilesPath());
+    }
+
+    const QFileInfo targetInfo(rootDir.filePath(folderName));
+    if (targetInfo.exists() || targetInfo.isSymLink()) {
+        sendError(409, QByteArrayLiteral("Conflict"),
+                  QStringLiteral("已存在同名文件或文件夹，请更换名称"));
+        return;
+    }
+
+    // 只创建一级目录，不使用 mkpath，避免请求被解释为嵌套路径。
+    if (!rootDir.mkdir(folderName)) {
+        const QFileInfo conflictInfo(rootDir.filePath(folderName));
+        if (conflictInfo.exists() || conflictInfo.isSymLink()) {
+            sendError(409, QByteArrayLiteral("Conflict"),
+                      QStringLiteral("已存在同名文件或文件夹，请更换名称"));
+        } else {
+            sendError(500, QByteArrayLiteral("Internal Server Error"),
+                      QStringLiteral("无法创建文件夹，请检查目录写入权限"));
+        }
+        return;
+    }
+
+    const QFileInfo folderInfo(rootDir.filePath(folderName));
+    const QString canonicalRoot = QDir::fromNativeSeparators(rootDir.canonicalPath());
+    const QString canonicalFolder = QDir::fromNativeSeparators(folderInfo.canonicalFilePath());
+    const QString rootPrefix = canonicalRoot.endsWith(QLatin1Char('/'))
+        ? canonicalRoot : canonicalRoot + QLatin1Char('/');
+    if (!folderInfo.isDir() || folderInfo.isSymLink()
+        || canonicalRoot.isEmpty() || canonicalFolder.isEmpty()
+        || !canonicalFolder.startsWith(rootPrefix)) {
+        rootDir.rmdir(folderName);
+        sendError(403, QByteArrayLiteral("Forbidden"),
+                  QStringLiteral("不允许在上传目录之外创建文件夹"));
+        return;
+    }
+
+    const QJsonObject folderObject{
+        {QStringLiteral("name"), folderName},
+        {QStringLiteral("path"), folderName},
+        {QStringLiteral("kind"), QStringLiteral("folder")},
+        {QStringLiteral("ext"), QStringLiteral("文件夹")},
+        {QStringLiteral("modified"), folderInfo.lastModified().toString(
+             QStringLiteral("yyyy-MM-dd HH:mm"))},
+        {QStringLiteral("size"), QStringLiteral("0 个文件")},
+        {QStringLiteral("fileCount"), 0},
+        {QStringLiteral("status"), QStringLiteral("已同步")},
+        {QStringLiteral("iconBg"), QStringLiteral("#FFF5E3")},
+        {QStringLiteral("iconColor"), QStringLiteral("#E9AD4E")}
+    };
+    const QJsonObject responseObject{
+        {QStringLiteral("success"), true},
+        {QStringLiteral("message"), QStringLiteral("文件夹创建成功")},
+        {QStringLiteral("name"), folderName},
+        {QStringLiteral("path"), folderName},
+        {QStringLiteral("folder"), folderObject}
+    };
+
+    qInfo().noquote() << QStringLiteral("新建文件夹成功：%1").arg(canonicalFolder);
+    sendJson(socket, 201, QByteArrayLiteral("Created"),
+             QJsonDocument(responseObject).toJson(QJsonDocument::Compact));
 }
 
 void LocalUploadServer::processRequest(QTcpSocket *socket,

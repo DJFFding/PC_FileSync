@@ -335,6 +335,58 @@ QString docxFileToHtml(const QString &filePath, QString *error)
     return html;
 }
 
+bool validateFolderName(const QString &folderName, QString *error)
+{
+    if (folderName.isEmpty()) {
+        *error = QStringLiteral("请输入文件夹名称");
+        return false;
+    }
+    if (folderName.size() > 100) {
+        *error = QStringLiteral("文件夹名称不能超过 100 个字符");
+        return false;
+    }
+    if (folderName == QStringLiteral(".") || folderName == QStringLiteral("..")) {
+        *error = QStringLiteral("文件夹名称不能是“.”或“..”");
+        return false;
+    }
+
+    const QString invalidCharacters = QStringLiteral("<>:\"/\\|?*");
+    for (const QChar ch : folderName) {
+        if (ch.unicode() < 32 || invalidCharacters.contains(ch)) {
+            *error = QStringLiteral("名称不能包含 < > : \" / \\ | ? * 或控制字符");
+            return false;
+        }
+    }
+
+    // 与 Windows 的命名规则保持一致，避免同步到不同平台后目录不可用。
+    if (folderName.endsWith(QLatin1Char('.')) || folderName.endsWith(QLatin1Char(' '))) {
+        *error = QStringLiteral("文件夹名称不能以句点或空格结尾");
+        return false;
+    }
+
+    QString baseName = folderName;
+    const int firstDot = baseName.indexOf(QLatin1Char('.'));
+    if (firstDot > 0)
+        baseName = baseName.left(firstDot);
+    baseName = baseName.toUpper();
+
+    const bool reservedDeviceName = baseName == QStringLiteral("CON")
+                                    || baseName == QStringLiteral("PRN")
+                                    || baseName == QStringLiteral("AUX")
+                                    || baseName == QStringLiteral("NUL")
+                                    || ((baseName.startsWith(QStringLiteral("COM"))
+                                         || baseName.startsWith(QStringLiteral("LPT")))
+                                        && baseName.size() == 4
+                                        && baseName.at(3) >= QLatin1Char('1')
+                                        && baseName.at(3) <= QLatin1Char('9'));
+    if (reservedDeviceName) {
+        *error = QStringLiteral("该名称是系统保留名称，请更换文件夹名称");
+        return false;
+    }
+
+    return true;
+}
+
 QString displayModified(const QJsonObject &object)
 {
     QString value = object.value(QStringLiteral("modified")).toString();
@@ -472,6 +524,7 @@ UploadManager::UploadManager(QObject *parent)
 QString UploadManager::serverUrl() const { return m_serverUrl; }
 bool UploadManager::uploading() const { return m_uploading; }
 bool UploadManager::loadingFiles() const { return m_loadingFiles; }
+bool UploadManager::creatingFolder() const { return m_creatingFolder; }
 int UploadManager::progress() const { return m_progress; }
 QString UploadManager::currentFile() const { return m_currentFile; }
 QString UploadManager::statusText() const { return m_statusText; }
@@ -616,6 +669,115 @@ void UploadManager::loadFiles()
         setLoadingFiles(false);
         setListStatus(QStringLiteral("加载完成，共 %1 个文件/目录").arg(items.size()));
         emit filesLoaded(items);
+    });
+}
+
+void UploadManager::createFolder(const QString &folderName)
+{
+    const QString name = folderName.trimmed();
+    if (m_creatingFolder) {
+        setListStatus(QStringLiteral("正在创建其他文件夹，请稍后再试"));
+        return;
+    }
+
+    QString validationError;
+    if (!validateFolderName(name, &validationError)) {
+        setListStatus(QStringLiteral("新建文件夹失败：%1").arg(validationError));
+        emit folderCreationFailed(name, validationError);
+        return;
+    }
+
+    // 与文件内容 URL 的推导方式一致：将 /files 映射为同级的 /folders。
+    QUrl endpoint(m_fileListUrl);
+    if (!endpoint.isValid()
+        || (endpoint.scheme() != QStringLiteral("http")
+            && endpoint.scheme() != QStringLiteral("https"))) {
+        const QString reason = QStringLiteral("文件服务地址无效：请填写 http 或 https 地址");
+        setListStatus(reason);
+        emit folderCreationFailed(name, reason);
+        return;
+    }
+
+    QString basePath = endpoint.path();
+    const int lastSlash = basePath.lastIndexOf(QLatin1Char('/'));
+    basePath = lastSlash >= 0 ? basePath.left(lastSlash + 1) : QStringLiteral("/");
+    endpoint.setPath(basePath + QStringLiteral("folders"));
+    endpoint.setQuery(QUrlQuery());
+    endpoint.setFragment(QString());
+
+    QNetworkRequest request(endpoint);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setRawHeader(QByteArrayLiteral("Content-Type"),
+                         QByteArrayLiteral("application/json; charset=utf-8"));
+    request.setTransferTimeout(30000);
+
+    const QJsonObject payload{
+        {QStringLiteral("name"), name}
+    };
+
+    setCreatingFolder(true);
+    setListStatus(QStringLiteral("正在新建文件夹：%1").arg(name));
+    m_folderReply = m_network.post(
+        request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
+
+    connect(m_folderReply, &QNetworkReply::finished, this, [this, name]() {
+        if (!m_folderReply)
+            return;
+
+        QNetworkReply *reply = m_folderReply;
+        m_folderReply = nullptr;
+        const QByteArray responseBody = reply->readAll();
+        const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString networkError = reply->errorString();
+        const bool hasNetworkError = reply->error() != QNetworkReply::NoError;
+        reply->deleteLater();
+
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(responseBody, &parseError);
+        const bool hasJsonObject = parseError.error == QJsonParseError::NoError
+                                   && document.isObject();
+        const QJsonObject responseObject = hasJsonObject ? document.object() : QJsonObject();
+        const QString serverMessage = responseObject.value(QStringLiteral("message")).toString();
+
+        QString error;
+        if (hasNetworkError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = serverMessage.isEmpty() ? networkError : serverMessage;
+            if (error.trimmed().isEmpty())
+                error = QStringLiteral("服务器返回异常响应");
+            if (serverMessage.isEmpty() && httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        } else if (!responseBody.isEmpty() && !hasJsonObject) {
+            error = QStringLiteral("服务器返回的新建文件夹结果不是有效 JSON 对象");
+        } else if (responseObject.contains(QStringLiteral("success"))
+                   && !responseObject.value(QStringLiteral("success")).toBool()) {
+            error = serverMessage.isEmpty()
+                ? QStringLiteral("服务器未能创建文件夹") : serverMessage;
+        }
+
+        if (!error.isEmpty()) {
+            setCreatingFolder(false);
+            setListStatus(QStringLiteral("新建文件夹失败：%1").arg(error));
+            emit folderCreationFailed(name, error);
+            return;
+        }
+
+        const QJsonObject folderObject = responseObject.value(QStringLiteral("folder")).toObject();
+        const QString actualName = folderObject.value(QStringLiteral("name")).toString(name);
+        const QString folderPath = folderObject.value(QStringLiteral("path")).toString(
+            responseObject.value(QStringLiteral("path")).toString(actualName));
+
+        QString modifiedText = displayModified(folderObject);
+        if (modifiedText == QStringLiteral("--"))
+            modifiedText = displayModified(responseObject);
+        if (modifiedText == QStringLiteral("--")) {
+            modifiedText = QDateTime::currentDateTime().toString(
+                QStringLiteral("yyyy-MM-dd HH:mm"));
+        }
+
+        setCreatingFolder(false);
+        setListStatus(QStringLiteral("文件夹“%1”创建成功").arg(actualName));
+        emit folderCreated(actualName, folderPath, modifiedText);
     });
 }
 
@@ -1155,6 +1317,14 @@ void UploadManager::setLoadingFiles(bool value)
         return;
     m_loadingFiles = value;
     emit loadingFilesChanged();
+}
+
+void UploadManager::setCreatingFolder(bool value)
+{
+    if (m_creatingFolder == value)
+        return;
+    m_creatingFolder = value;
+    emit creatingFolderChanged();
 }
 
 void UploadManager::setProgress(int value)

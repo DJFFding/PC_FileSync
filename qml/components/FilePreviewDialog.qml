@@ -29,6 +29,9 @@ Dialog {
     property string previewKind: ""
 
     property string imageSource: ""
+    property real imageScale: 1.0
+    readonly property real imageMinScale: 0.1
+    readonly property real imageMaxScale: 8.0
     property string pdfSource: ""
     property int pdfPageCount: 0
     property int pdfCurrentPage: 0
@@ -175,6 +178,7 @@ Dialog {
         sourceUrl = manager.fileContentUrl(path)
 
         imageSource = ""
+        imageScale = 1.0
         pdfSource = ""
         pdfPageCount = 0
         pdfCurrentPage = 0
@@ -229,7 +233,7 @@ Dialog {
                 return "正在加载原始图片…"
             if (imageView.status === Image.Ready)
                 return imageView.implicitWidth + " × " + imageView.implicitHeight
-                       + "，等比完整显示"
+                       + "，显示比例 " + Math.round(imageScale * 100) + "%（滚轮缩放）"
             return "暂无图片地址"
         }
         if (previewKind === "text") {
@@ -508,6 +512,7 @@ Dialog {
     onClosed: {
         abortWork()
         imageSource = ""
+        imageScale = 1.0
         pdfSource = ""
         pdfPageCount = 0
         pdfCurrentPage = 0
@@ -642,6 +647,22 @@ Dialog {
             anchors.bottom: parent.bottom
             clip: true
 
+            WheelHandler {
+                target: viewport
+                enabled: dialog.previewKind === "image"
+                acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+
+                onWheel: function(event) {
+                    if (event.angleDelta.y === 0)
+                        return
+
+                    var factor = event.angleDelta.y > 0 ? 1.1 : 1 / 1.1
+                    dialog.imageScale = Math.max(dialog.imageMinScale,
+                            Math.min(dialog.imageMaxScale, dialog.imageScale * factor))
+                    event.accepted = true
+                }
+            }
+
             // 原始分辨率加载，不设置 sourceSize；PreserveAspectFit 保证宽或高铺满，
             // 另一方向留下的区域由页面背景色填充，不裁切、不拉伸。
             Image {
@@ -649,6 +670,8 @@ Dialog {
                 anchors.fill: parent
                 visible: dialog.previewKind === "image"
                 source: dialog.imageSource
+                scale: dialog.imageScale
+                transformOrigin: Item.Center
                 fillMode: Image.PreserveAspectFit
                 horizontalAlignment: Image.AlignHCenter
                 verticalAlignment: Image.AlignVCenter
