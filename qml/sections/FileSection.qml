@@ -17,7 +17,12 @@ Item {
     objectName: "fileManagerPage"
 
     // 可由 C++ 设置为 QAbstractListModel；模型角色需包含 name/kind/ext/modified/size/status/iconBg/iconColor。
+    // 文件预览使用 path；服务端还可提供 previewType（image/text/binary）和 mimeType。
     property var fileModelSource: fileModel
+
+    // 图片高度按原始尺寸和宽高比计算；该值仅限制极端长图，不会裁切或拉伸图片。
+    property real maxImagePreviewHeight: 720
+    property int textPreviewByteLimit: 65536
 
     // 与登录页面保持一致的主题色
     property color primaryColor: "#4B6EF5"
@@ -49,6 +54,8 @@ Item {
     signal shareRequested(string fileName)
     signal deleteRequested(string fileName)
     signal openFileRequested(string fileName)
+    signal previewRequested(string fileName, string filePath, string previewType,
+                            string extension, string mimeType)
     signal refreshRequested()
     signal syncNowRequested()
     signal navigationChanged(string navigation)
@@ -77,6 +84,59 @@ Item {
 
     function matchesSearch(name) {
         return searchKeyword.length === 0 || name.toLowerCase().indexOf(searchKeyword.toLowerCase()) !== -1
+    }
+
+    function isImageExtension(extension) {
+        if (extension === undefined || extension === null)
+            return false
+
+        var value = extension.toString().toLowerCase()
+        return ["jpg", "jpeg", "png", "gif", "bmp", "webp",
+                "svg", "ico", "tif", "tiff"].indexOf(value) !== -1
+    }
+
+    function isTextExtension(extension) {
+        if (extension === undefined || extension === null)
+            return false
+
+        var value = extension.toString().toLowerCase()
+        return ["txt", "md", "markdown", "log", "json", "xml", "yaml", "yml",
+                "csv", "tsv", "ini", "cfg", "conf", "properties", "html", "htm",
+                "css", "js", "ts", "qml", "c", "h", "cpp", "hpp", "cc", "cxx",
+                "java", "py", "sh", "bat", "sql", "vue", "php", "rb", "go", "rs"
+               ].indexOf(value) !== -1
+    }
+
+    function previewTypeForExtension(extension) {
+        if (isImageExtension(extension))
+            return "image"
+        if (isTextExtension(extension))
+            return "text"
+        return "binary"
+    }
+
+    function fileTypeDescription(extension) {
+        if (extension === undefined || extension === null)
+            return "文件"
+
+        var value = extension.toString().toLowerCase()
+        if (value === "pdf")
+            return "PDF 文档"
+        if (["doc", "docx", "rtf", "odt"].indexOf(value) !== -1)
+            return "文字文档"
+        if (["xls", "xlsx", "csv", "ods"].indexOf(value) !== -1)
+            return "表格文件"
+        if (["ppt", "pptx", "odp"].indexOf(value) !== -1)
+            return "演示文稿"
+        if (["txt", "md", "log", "json", "xml"].indexOf(value) !== -1)
+            return "文本文件"
+        if (["mp4", "mov", "avi", "mkv", "webm"].indexOf(value) !== -1)
+            return "视频文件"
+        if (["mp3", "wav", "flac", "aac", "ogg"].indexOf(value) !== -1)
+            return "音频文件"
+        if (["zip", "rar", "7z", "tar", "gz"].indexOf(value) !== -1)
+            return "压缩文件"
+        return value.length > 0 ? value.toUpperCase() + " 文件" : "文件"
     }
 
     Rectangle {
@@ -832,9 +892,147 @@ Item {
                                     delegate: Item {
                                         id: fileRow
                                         width: fileListView.width
+
+                                        readonly property int informationHeight: 56
+                                        property string filePath: typeof path === "undefined" || path === null ? "" : path.toString()
+                                        property string serverPreviewType: typeof previewType === "undefined" || previewType === null ? "" : previewType.toString()
+                                        property string serverMimeType: typeof mimeType === "undefined" || mimeType === null ? "" : mimeType.toString()
+                                        property bool hasPreview: kind !== "folder"
+                                        property bool isImage: hasPreview && (serverPreviewType === "image"
+                                                               || (serverPreviewType.length === 0 && root.isImageExtension(ext)))
+                                        property bool isText: hasPreview && !isImage && (serverPreviewType === "text"
+                                                              || (serverPreviewType.length === 0 && root.isTextExtension(ext)))
+                                        property string contentSource: (isImage || isText) && filePath.length > 0
+                                                                       ? uploadManager.fileContentUrl(filePath) : ""
+                                        property string imageSource: isImage ? contentSource : ""
+                                        property string textSource: {
+                                            if (!isText || contentSource.length === 0)
+                                                return ""
+                                            if (contentSource.indexOf("http://") !== 0 && contentSource.indexOf("https://") !== 0)
+                                                return contentSource
+                                            return contentSource + (contentSource.indexOf("?") >= 0 ? "&" : "?")
+                                                   + "maxBytes=" + root.textPreviewByteLimit
+                                        }
+
+                                        // 使用图片原始 implicit 尺寸计算显示大小，小图不放大，大图等比缩小。
+                                        property real availableImageWidth: Math.max(1, previewRow.width - 12)
+                                        property real imageScale: {
+                                            if (previewImage.status !== Image.Ready
+                                                    || previewImage.implicitWidth <= 0
+                                                    || previewImage.implicitHeight <= 0)
+                                                return 1
+                                            return Math.min(1,
+                                                            availableImageWidth / previewImage.implicitWidth,
+                                                            Math.max(1, root.maxImagePreviewHeight) / previewImage.implicitHeight)
+                                        }
+                                        property real imageContentWidth: previewImage.status === Image.Ready
+                                                                         ? Math.max(1, Math.round(previewImage.implicitWidth * imageScale))
+                                                                         : availableImageWidth
+                                        property real imageContentHeight: previewImage.status === Image.Ready
+                                                                          ? Math.max(1, Math.round(previewImage.implicitHeight * imageScale))
+                                                                          : 96
+
+                                        property string textContent: ""
+                                        property string textLoadError: ""
+                                        property bool textLoading: false
+                                        property bool textTruncated: false
+                                        property bool copySucceeded: false
+                                        property int textRequestGeneration: 0
+                                        property real previewHeight: isImage ? Math.ceil(imageContentHeight + 12)
+                                                                              : (isText ? Math.min(260, Math.max(96, Math.ceil(textPreviewEdit.contentHeight + 50))) : 52)
                                         property bool rowVisible: root.matchesFilter(kind) && root.matchesSearch(name)
-                                        height: rowVisible ? 56 : 0
+
+                                        height: rowVisible ? informationHeight + (hasPreview ? previewHeight + 10 : 0) : 0
                                         visible: rowVisible
+
+                                        function loadTextPreview() {
+                                            var source = textSource
+                                            var generation = ++textRequestGeneration
+                                            textContent = ""
+                                            textLoadError = ""
+                                            textTruncated = false
+                                            copySucceeded = false
+
+                                            if (!isText) {
+                                                textLoading = false
+                                                return
+                                            }
+                                            if (source.length === 0) {
+                                                textLoading = false
+                                                textLoadError = "暂无文本文件地址"
+                                                return
+                                            }
+
+                                            textLoading = true
+                                            var request = new XMLHttpRequest()
+                                            request.onreadystatechange = function() {
+                                                if (request.readyState !== XMLHttpRequest.DONE
+                                                        || generation !== textRequestGeneration)
+                                                    return
+
+                                                textLoading = false
+                                                var remoteRequest = source.indexOf("http://") === 0 || source.indexOf("https://") === 0
+                                                var succeeded = (request.status >= 200 && request.status < 300)
+                                                                || (request.status === 0 && !remoteRequest)
+                                                if (succeeded) {
+                                                    textContent = request.responseText === undefined ? "" : request.responseText
+                                                    try {
+                                                        textTruncated = request.getResponseHeader("X-Preview-Truncated") === "1"
+                                                    } catch (error) {
+                                                        textTruncated = false
+                                                    }
+                                                } else {
+                                                    textLoadError = request.status > 0
+                                                            ? "文本加载失败（HTTP " + request.status + "）"
+                                                            : "文本加载失败，请检查网络或文件地址"
+                                                }
+                                            }
+                                            request.open("GET", source, true)
+                                            request.send()
+                                        }
+
+                                        function copyTextPreview() {
+                                            if (textContent.length === 0)
+                                                return
+
+                                            // 在切换焦点前保存选区状态。
+                                            var hasSelection = textPreviewEdit.selectedText.length > 0
+                                            var selectionStart = textPreviewEdit.selectionStart
+                                            var selectionEnd = textPreviewEdit.selectionEnd
+
+                                            textPreviewEdit.forceActiveFocus()
+
+                                            if (hasSelection) {
+                                                // 恢复用户选区，避免焦点变化造成选区丢失。
+                                                textPreviewEdit.select(selectionStart, selectionEnd)
+                                            } else {
+                                                // 没有选区时，复制当前已加载的预览全文。
+                                                textPreviewEdit.selectAll()
+                                            }
+
+                                            textPreviewEdit.copy()
+
+                                            if (hasSelection) {
+                                                // 保留用户原有选区，方便再次复制或调整。
+                                                textPreviewEdit.select(selectionStart, selectionEnd)
+                                            } else {
+                                                // 如果选区是本次 selectAll() 临时创建的，复制后恢复无选区状态。
+                                                textPreviewEdit.deselect()
+                                            }
+
+                                            copySucceeded = true
+                                            copyFeedbackTimer.restart()
+                                        }
+
+                                        onTextSourceChanged: {
+                                            textRequestGeneration += 1
+                                            textContent = ""
+                                            textLoadError = ""
+                                            textLoading = isText && textSource.length > 0
+                                            textLoadTimer.restart()
+                                        }
+                                        Component.onCompleted: textLoadTimer.start()
+                                        Component.onDestruction: textRequestGeneration += 1
 
                                         Rectangle {
                                             anchors.fill: parent
@@ -854,13 +1052,29 @@ Item {
                                             hoverEnabled: true
                                             cursorShape: Qt.PointingHandCursor
                                             onClicked: root.selectFile(name, kind, modified, size, status, ext)
-                                            onDoubleClicked: root.openFileRequested(name)
+                                            onDoubleClicked: {
+                                                if (kind === "folder") {
+                                                    root.openFileRequested(name)
+                                                    return
+                                                }
+
+                                                // 文件预览由 Main.qml 的全屏对话框统一处理；
+                                                // 不支持的二进制类型会在 openPreview() 中直接忽略。
+                                                root.previewRequested(name, fileRow.filePath,
+                                                                      fileRow.serverPreviewType,
+                                                                      ext, fileRow.serverMimeType)
+                                            }
                                         }
 
+                                        // 第一行：名称、修改时间、大小和同步状态。
                                         Row {
-                                            anchors.fill: parent
+                                            id: informationRow
+                                            anchors.top: parent.top
+                                            anchors.left: parent.left
+                                            anchors.right: parent.right
                                             anchors.leftMargin: 16
                                             anchors.rightMargin: 13
+                                            height: fileRow.informationHeight
                                             spacing: 0
 
                                             Row {
@@ -960,6 +1174,288 @@ Item {
                                                     rowMenu.fileName = name
                                                     rowMenu.open()
                                                 }
+                                            }
+                                        }
+
+                                        // 第二行：图片按原始比例显示，文本可阅读复制，仅二进制文件使用占位卡片。
+                                        Item {
+                                            id: previewRow
+                                            anchors.top: informationRow.bottom
+                                            anchors.left: parent.left
+                                            anchors.right: parent.right
+                                            anchors.leftMargin: 60
+                                            anchors.rightMargin: 46
+                                            height: fileRow.previewHeight
+                                            visible: fileRow.hasPreview
+
+                                            // 图片预览：高度随原始宽高比变化，不使用固定高度或裁切填充。
+                                            Rectangle {
+                                                anchors.fill: parent
+                                                visible: fileRow.isImage
+                                                radius: 8
+                                                color: root.selectedName === name ? "#EDF2FC" : "#F5F7FB"
+                                                border.color: "#E4EAF3"
+                                                border.width: 1
+                                                clip: true
+
+                                                Image {
+                                                    id: previewImage
+                                                    anchors.horizontalCenter: parent.horizontalCenter
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    width: fileRow.imageContentWidth
+                                                    height: fileRow.imageContentHeight
+                                                    source: fileRow.imageSource
+                                                    asynchronous: true
+                                                    cache: true
+                                                    autoTransform: true
+                                                    fillMode: Image.PreserveAspectFit
+                                                    horizontalAlignment: Image.AlignHCenter
+                                                    verticalAlignment: Image.AlignVCenter
+                                                    smooth: true
+                                                    mipmap: true
+
+                                                    // 不用显示尺寸覆盖 sourceSize，保留原始 implicit 尺寸及宽高比。
+                                                }
+
+                                                BusyIndicator {
+                                                    anchors.centerIn: parent
+                                                    width: 24
+                                                    height: 24
+                                                    running: previewImage.status === Image.Loading
+                                                    visible: running
+                                                }
+
+                                                Text {
+                                                    anchors.centerIn: parent
+                                                    visible: fileRow.imageSource.length === 0 || previewImage.status === Image.Error
+                                                    text: fileRow.imageSource.length === 0 ? "暂无图片地址" : "图片加载失败"
+                                                    color: "#98A5B9"
+                                                    font.pixelSize: 10
+                                                }
+                                            }
+
+                                            // 文本预览：最多读取前 64 KB，支持滚动、鼠标选择和复制。
+                                            Rectangle {
+                                                anchors.fill: parent
+                                                visible: fileRow.isText
+                                                radius: 8
+                                                color: root.selectedName === name ? "#F0F4FD" : "#F8FAFD"
+                                                border.color: "#E3EAF4"
+                                                border.width: 1
+                                                clip: true
+
+                                                Text {
+                                                    anchors.left: parent.left
+                                                    anchors.leftMargin: 11
+                                                    anchors.right: parent.right
+                                                    anchors.rightMargin: 76
+                                                    anchors.top: parent.top
+                                                    height: 33
+                                                    text: fileRow.textTruncated
+                                                          ? "文本预览（前 " + Math.round(root.textPreviewByteLimit / 1024) + " KB）"
+                                                          : "文本预览"
+                                                    color: "#7D8BA1"
+                                                    font.pixelSize: 9
+                                                    font.weight: Font.Medium
+                                                    verticalAlignment: Text.AlignVCenter
+                                                    elide: Text.ElideRight
+                                                }
+
+                                                Button {
+                                                    id: copyTextButton
+                                                    focusPolicy: Qt.NoFocus
+                                                    anchors.top: parent.top
+                                                    anchors.topMargin: 4
+                                                    anchors.right: parent.right
+                                                    anchors.rightMargin: 7
+                                                    width: 59
+                                                    height: 25
+                                                    enabled: !fileRow.textLoading && fileRow.textContent.length > 0
+                                                    hoverEnabled: true
+                                                    background: Rectangle {
+                                                        radius: 6
+                                                        color: !copyTextButton.enabled ? "#EDF1F6"
+                                                               : copyTextButton.down ? "#E1E8FA"
+                                                               : copyTextButton.hovered ? "#E8EEFF" : "#F0F4FF"
+                                                        border.color: "#DCE5F5"
+                                                    }
+                                                    contentItem: Text {
+                                                        text: fileRow.copySucceeded ? "已复制" : "复制"
+                                                        color: copyTextButton.enabled ? root.primaryColor : "#A7B2C2"
+                                                        font.pixelSize: 9
+                                                        font.weight: Font.Medium
+                                                        horizontalAlignment: Text.AlignHCenter
+                                                        verticalAlignment: Text.AlignVCenter
+                                                    }
+                                                    onClicked: fileRow.copyTextPreview()
+                                                    ToolTip.visible: hovered
+                                                    ToolTip.text: "复制选中文本；未选择时复制全部"
+                                                }
+
+                                                Rectangle {
+                                                    anchors.left: parent.left
+                                                    anchors.right: parent.right
+                                                    anchors.top: parent.top
+                                                    anchors.topMargin: 32
+                                                    height: 1
+                                                    color: "#E9EEF6"
+                                                }
+
+                                                Flickable {
+                                                    id: textViewport
+                                                    anchors.left: parent.left
+                                                    anchors.right: parent.right
+                                                    anchors.top: parent.top
+                                                    anchors.bottom: parent.bottom
+                                                    anchors.leftMargin: 9
+                                                    anchors.rightMargin: 9
+                                                    anchors.topMargin: 38
+                                                    anchors.bottomMargin: 7
+                                                    visible: !fileRow.textLoading && fileRow.textLoadError.length === 0
+                                                             && fileRow.textContent.length > 0
+                                                    clip: true
+                                                    contentWidth: width
+                                                    contentHeight: textPreviewEdit.contentHeight
+                                                    boundsBehavior: Flickable.StopAtBounds
+                                                    flickableDirection: Flickable.VerticalFlick
+
+                                                    TextEdit {
+                                                        id: textPreviewEdit
+                                                        x: 2
+                                                        width: Math.max(1, textViewport.width - 4)
+                                                        height: contentHeight
+                                                        text: fileRow.textContent
+
+                                                        readOnly: true
+                                                        selectByMouse: true
+                                                        selectByKeyboard: true
+                                                        cursorVisible: false
+
+                                                        color: "#4C5C74"
+                                                        selectionColor: root.primaryColor
+                                                        selectedTextColor: "#FFFFFF"
+
+                                                        font.family: "monospace"
+                                                        font.pixelSize: 10
+                                                        wrapMode: TextEdit.WrapAtWordBoundaryOrAnywhere
+                                                        textFormat: TextEdit.PlainText
+
+                                                        // 阻止 TextEdit 提前执行默认的 Ctrl+C，
+                                                        // 让下面的 Keys.onPressed 统一处理。
+                                                        Keys.onShortcutOverride: function(event) {
+                                                            if (event.key === Qt.Key_C
+                                                                    && (event.modifiers & Qt.ControlModifier)) {
+                                                                event.accepted = true
+                                                            }
+                                                        }
+
+                                                        Keys.onPressed: function(event) {
+                                                            if (event.key === Qt.Key_C
+                                                                    && (event.modifiers & Qt.ControlModifier)) {
+                                                                if (!event.isAutoRepeat)
+                                                                    fileRow.copyTextPreview()
+
+                                                                // 阻止事件继续传递，避免重复复制。
+                                                                event.accepted = true
+                                                            }
+                                                        }
+                                                    }
+
+                                                    ScrollBar.vertical: ScrollBar {
+                                                        policy: ScrollBar.AsNeeded
+                                                    }
+                                                }
+
+                                                BusyIndicator {
+                                                    anchors.centerIn: parent
+                                                    width: 22
+                                                    height: 22
+                                                    running: fileRow.textLoading
+                                                    visible: running
+                                                }
+
+                                                Text {
+                                                    anchors.centerIn: parent
+                                                    width: parent.width - 24
+                                                    visible: !fileRow.textLoading && (fileRow.textLoadError.length > 0
+                                                             || fileRow.textContent.length === 0)
+                                                    text: fileRow.textLoadError.length > 0
+                                                          ? fileRow.textLoadError : "文本内容为空"
+                                                    color: fileRow.textLoadError.length > 0 ? "#C77B76" : "#98A5B9"
+                                                    font.pixelSize: 10
+                                                    horizontalAlignment: Text.AlignHCenter
+                                                    wrapMode: Text.WordWrap
+                                                }
+                                            }
+
+                                            // 非图片、非文本文件按二进制文件处理。
+                                            Rectangle {
+                                                anchors.fill: parent
+                                                visible: !fileRow.isImage && !fileRow.isText
+                                                radius: 8
+                                                color: root.selectedName === name ? "#F0F4FD" : "#F8FAFD"
+                                                border.color: "#EAF0F6"
+                                                border.width: 1
+
+                                                Rectangle {
+                                                    id: previewTypeIcon
+                                                    anchors.left: parent.left
+                                                    anchors.leftMargin: 11
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    width: 32
+                                                    height: 32
+                                                    radius: 7
+                                                    color: iconBg
+
+                                                    Text {
+                                                        anchors.centerIn: parent
+                                                        width: parent.width - 4
+                                                        text: ext
+                                                        color: iconColor
+                                                        font.pixelSize: 8
+                                                        font.weight: Font.DemiBold
+                                                        horizontalAlignment: Text.AlignHCenter
+                                                        elide: Text.ElideRight
+                                                    }
+                                                }
+
+                                                Column {
+                                                    anchors.left: parent.left
+                                                    anchors.leftMargin: 54
+                                                    anchors.right: parent.right
+                                                    anchors.rightMargin: 12
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    spacing: 3
+
+                                                    Text {
+                                                        width: parent.width
+                                                        text: root.fileTypeDescription(ext)
+                                                        color: "#596981"
+                                                        font.pixelSize: 10
+                                                        font.weight: Font.Medium
+                                                        elide: Text.ElideRight
+                                                    }
+                                                    Text {
+                                                        width: parent.width
+                                                        text: "二进制文件暂不支持内嵌预览，双击可打开"
+                                                        color: "#A0ADBE"
+                                                        font.pixelSize: 9
+                                                        elide: Text.ElideRight
+                                                    }
+                                                }
+                                            }
+
+                                            Timer {
+                                                id: textLoadTimer
+                                                interval: 0
+                                                repeat: false
+                                                onTriggered: fileRow.loadTextPreview()
+                                            }
+                                            Timer {
+                                                id: copyFeedbackTimer
+                                                interval: 1500
+                                                repeat: false
+                                                onTriggered: fileRow.copySucceeded = false
                                             }
                                         }
                                     }
@@ -1292,49 +1788,11 @@ Item {
         }
     }
 
-    // 新建文件夹对话框
-    Dialog {
-        id: createFolderDialog
-        title: "新建文件夹"
-        modal: true
-        width: 340
-        x: (root.width - width) / 2
-        y: (root.height - height) / 2
-        standardButtons: Dialog.Ok | Dialog.Cancel
-
-        contentItem: Column {
-            spacing: 9
-            Text {
-                text: "请输入文件夹名称"
-                color: root.textMidColor
-                font.pixelSize: 11
-            }
-            TextField {
-                id: folderNameField
-                width: 292
-                height: 39
-                placeholderText: "例如：产品设计资料"
-                selectByMouse: true
-                background: Rectangle {
-                    radius: 7
-                    color: "#FFFFFF"
-                    border.color: folderNameField.activeFocus ? root.primaryColor : "#DCE4F0"
-                }
-            }
-        }
-
-        onAccepted: {
-            var folderName = folderNameField.text.trim()
-            if (folderName.length > 0)
-                root.createFolderRequested(folderName)
-            folderNameField.clear()
-        }
-        onRejected: folderNameField.clear()
-    }
-
     // 示例文件数据：接入 C++ 后可替换为 QAbstractListModel
     ListModel {
         id: fileModel
+        dynamicRoles: true
+        /*
         ListElement {
             name: "项目资料"
             kind: "folder"
@@ -1415,6 +1873,7 @@ Item {
             iconBg: "#FFF0E9"
             iconColor: "#E58A54"
         }
+        */
     }
 
 
@@ -1428,10 +1887,23 @@ Item {
     Connections {
         target: uploadManager
 
+        // 服务器文件列表加载成功
+        function onFilesLoaded(items) {
+            fileModel.clear()
+
+            for (var i = 0; i < items.length; ++i) {
+                fileModel.append(items[i])
+            }
+        }
+
+        // 单个文件上传成功
         function onFileUploaded(fileName, displaySize, modifiedText) {
             var dot = fileName.lastIndexOf(".")
-            var ext = dot >= 0 ? fileName.substring(dot + 1).toUpperCase() : "FILE"
-            fileModel.insert(0, {
+            var ext = dot >= 0
+                    ? fileName.substring(dot + 1).toUpperCase()
+                    : "FILE"
+
+            var item = {
                 name: fileName,
                 kind: "file",
                 ext: ext,
@@ -1439,9 +1911,39 @@ Item {
                 size: displaySize,
                 status: "已同步",
                 iconBg: "#EEF2FF",
-                iconColor: "#4B6EF5"
-            })
+                iconColor: "#4B6EF5",
+                path: fileName,
+                previewType: root.previewTypeForExtension(ext),
+                mimeType: ""
+            }
+
+            // 避免同名文件重复插入
+            var found = -1
+
+            for (var i = 0; i < fileModel.count; ++i) {
+                if (fileModel.get(i).name === fileName) {
+                    found = i
+                    break
+                }
+            }
+
+            if (found >= 0)
+                fileModel.set(found, item)
+            else
+                fileModel.insert(0, item)
+        }
+
+        // 所有上传任务完成
+        function onUploadFinished(successCount, failedCount) {
+            if (successCount > 0)
+                uploadManager.loadFiles()
+        }
+
+        function onFilesLoadFailed(reason) {
+            console.warn("加载文件列表失败：" + reason)
         }
     }
-
+    Component.onCompleted: {
+        uploadManager.loadFiles()
+    }
 }

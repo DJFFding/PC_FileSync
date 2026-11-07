@@ -294,7 +294,14 @@ ApplicationWindow {
                             cornerRadius: window.windowCornerRadius
                         }
 
-                        FileSection{
+                        FileSection {
+                            id: fileSection
+
+                            onPreviewRequested: function(fileName, filePath, previewType,
+                                                         extension, mimeType) {
+                                filePreviewDialog.openPreview(fileName, filePath, previewType,
+                                                             extension, mimeType)
+                            }
                         }
                     }
 
@@ -315,5 +322,11 @@ ApplicationWindow {
             z: 9999
             enabled: false
         }
+    }
+
+    // parent 在组件内部设置为 Overlay.overlay，因此覆盖整个 Main 窗口（含标题栏和侧栏）。
+    FilePreviewDialog {
+        id: filePreviewDialog
+        manager: uploadManager
     }
 }
