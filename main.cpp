@@ -1,4 +1,5 @@
 #include "UploadManager.h"
+#include "MuPdfImageProvider.h"
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQuickStyle>
@@ -17,6 +18,8 @@ int main(int argc, char *argv[])
         &app,
         []() { QCoreApplication::exit(-1); },
         Qt::QueuedConnection);
+    engine.addImageProvider(QStringLiteral("mupdf"),
+                            new MuPdfImageProvider);
     engine.rootContext()->setContextProperty(
         "uploadManager",
         &uploadManager
