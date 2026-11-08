@@ -207,30 +207,41 @@ Dialog {
                         font.weight: Font.DemiBold
                     }
 
-                    TextArea {
-                        id: resultTextArea
+                    ScrollView {
+                        id: resultScrollView
+
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        text: root.succeeded
-                              ? (root.localPath.length > 0 ? root.localPath : "未返回本地保存路径")
-                              : (root.reason.length > 0 ? root.reason : "未知错误，请检查网络连接后重试。")
-                        color: root.succeeded ? "#53637D" : "#C56F69"
-                        font.pixelSize: 11
-                        wrapMode: TextEdit.WrapAnywhere
-                        readOnly: true
-                        selectByMouse: true
-                        selectByKeyboard: true
-                        selectionColor: root.primaryColor
-                        selectedTextColor: "#FFFFFF"
-                        padding: 0
-                        background: Item {}
-                        persistentSelection: true
+                        clip: true
 
                         ScrollBar.vertical: ScrollBar {
                             policy: ScrollBar.AsNeeded
                         }
-                    }
-                }
+
+                        ScrollBar.horizontal: ScrollBar {
+                            policy: ScrollBar.AlwaysOff
+                        }
+
+                        TextArea {
+                            id: resultTextArea
+                            width: resultScrollView.availableWidth
+
+                            text: root.succeeded
+                                  ? (root.localPath.length > 0 ? root.localPath : "未返回本地保存路径")
+                                  : (root.reason.length > 0 ? root.reason : "未知错误，请检查网络连接后重试。")
+                            color: root.succeeded ? "#53637D" : "#C56F69"
+                            font.pixelSize: 11
+                            wrapMode: TextEdit.WrapAnywhere
+                            readOnly: true
+                            selectByMouse: true
+                            selectByKeyboard: true
+                            selectionColor: root.primaryColor
+                            selectedTextColor: "#FFFFFF"
+                            padding: 0
+                            background: Item {}
+                            persistentSelection: true
+                        }
+                    }}
             }
 
             Item { Layout.fillWidth: true; Layout.fillHeight: true }

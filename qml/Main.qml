@@ -26,6 +26,24 @@ ApplicationWindow {
     property color page: "#F7F9FD"
     property color line: "#E8EDF6"
     property bool isMaximized: window.visibility === Window.Maximized
+    property real normalWindowWidth: 1120
+
+    // 记录普通窗口宽度，供最大化拖动还原时计算窗口位置。
+    onWidthChanged: {
+        if (window.visibility !== Window.Maximized && window.visibility !== Window.FullScreen) {
+            window.normalWindowWidth = window.width
+        }
+    }
+
+    function toggleMaximized() {
+        if (window.visibility === Window.Maximized) {
+            sidebar.Layout.preferredWidth = 202
+            window.showNormal()
+        } else {
+            sidebar.Layout.preferredWidth = 302
+            window.showMaximized()
+        }
+    }
 
     // ========== 统一窗口圆角变量，改这里就能同步所有外层圆角 ==========
     property int windowCornerRadius: 8
@@ -135,8 +153,8 @@ ApplicationWindow {
                             width: sidebar.width
                             label: "设置"
                             icon: "settings"
-                            selected: parent.currentIndex === 4
-                            onClicked: parent.currentIndex = 4
+                            selected: parent.currentIndex === 5
+                            onClicked: parent.currentIndex = 5
                         }
                     }
 
@@ -246,8 +264,69 @@ ApplicationWindow {
                         width: parent.width
                         height: 42
                         MouseArea {
+                            id: titleBarMouseArea
                             anchors.fill: parent
-                            onPressed: window.startSystemMove()
+                            acceptedButtons: Qt.LeftButton
+                            preventStealing: true
+
+                            property point pressGlobalPos
+                            property real pressRatioX: 0.0
+                            property real dragOffsetX: 0.0
+                            property real dragOffsetY: 0.0
+                            property bool dragging: false
+                            property bool pendingMaximizedRestore: false
+
+                            onPressed: function(mouse) {
+                                pressGlobalPos = mapToGlobal(mouse.x, mouse.y)
+                                pressRatioX = width > 0 ? mouse.x / width : 0.0
+                                dragOffsetX = pressGlobalPos.x - window.x
+                                dragOffsetY = pressGlobalPos.y - window.y
+                                dragging = true
+                                pendingMaximizedRestore = window.visibility === Window.Maximized
+                            }
+
+                            onPositionChanged: function(mouse) {
+                                if (!dragging) {
+                                    return
+                                }
+
+                                var currentGlobalPos = mapToGlobal(mouse.x, mouse.y)
+
+                                if (pendingMaximizedRestore) {
+                                    var deltaX = currentGlobalPos.x - pressGlobalPos.x
+                                    var deltaY = currentGlobalPos.y - pressGlobalPos.y
+
+                                    // 超过拖动阈值才还原，单击或双击最大化窗口时不会误还原。
+                                    if (Math.abs(deltaX) < 6 && Math.abs(deltaY) < 6) {
+                                        return
+                                    }
+
+                                    // 鼠标在还原后的标题栏中保持相同的水平相对位置。
+                                    dragOffsetX = 202 + pressRatioX * Math.max(0, window.normalWindowWidth - 202)
+                                    sidebar.Layout.preferredWidth = 202
+                                    pendingMaximizedRestore = false
+                                    window.showNormal()
+                                }
+
+                                window.x = currentGlobalPos.x - dragOffsetX
+                                window.y = currentGlobalPos.y - dragOffsetY
+                            }
+
+                            onReleased: {
+                                dragging = false
+                                pendingMaximizedRestore = false
+                            }
+
+                            onCanceled: {
+                                dragging = false
+                                pendingMaximizedRestore = false
+                            }
+
+                            onDoubleClicked: function(mouse) {
+                                dragging = false
+                                pendingMaximizedRestore = false
+                                window.toggleMaximized()
+                            }
                         }
                         Row {
                             anchors.right: parent.right
@@ -261,15 +340,7 @@ ApplicationWindow {
                             }
                             WindowButton {
                                 iconSource: window.visibility === Window.Maximized ? "qrc:/qt/qml/FileSync/assets/window-restore.svg" : "qrc:/qt/qml/FileSync/assets/window-maximize.svg"
-                                onClicked: {
-                                    if (window.visibility === Window.Maximized) {
-                                        sidebar.Layout.preferredWidth = 202
-                                        window.showNormal();
-                                    } else {
-                                        sidebar.Layout.preferredWidth = 302
-                                        window.showMaximized();
-                                    }
-                                }
+                                onClicked: window.toggleMaximized()
                             }
                             WindowButton {
                                 iconSource: "qrc:/qt/qml/FileSync/assets/window-close.svg"
