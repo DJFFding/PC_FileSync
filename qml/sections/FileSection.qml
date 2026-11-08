@@ -12,7 +12,8 @@ import FileSyncComponents 1.0
  *
  * 文件列表使用本地 ListModel；上传、列表和预览通过 C++ UploadManager 接入 HTTP 服务。
  * 服务器文件变化通过 WebSocket 主动推送，客户端自动刷新当前目录并在断线后重连。
- * 行菜单的打开、下载、重命名和移动由 UploadManager 完成；分享、删除、刷新和立即同步仍通过 signals 暴露给业务层。
+ * 行菜单的打开、下载、重命名、移动和收藏由 UploadManager 完成；分享、删除、刷新和立即同步仍通过 signals 暴露给业务层。
+ * 收藏文件夹时由服务器递归登记其全部后代，收藏页展示真实持久化数据。
  */
 Item {
     id: root
@@ -46,6 +47,11 @@ Item {
     property string currentNav: "我的文件"
     property string currentFilter: "全部"
     property string searchKeyword: ""
+    // 收藏夹使用独立的筛选条件，避免影响“我的文件”的列表状态。
+    property string favoriteFilter: "全部"
+    property string favoriteSearchKeyword: ""
+    // 默认使用 UploadManager 返回的真实收藏模型，也可由 C++ 替换为兼容模型。
+    property var favoritesModelSource: favoritesModel
     property bool detailsVisible: true
     property string selectedName: ""
     property string selectedKind: ""
@@ -74,11 +80,17 @@ Item {
     signal syncNowRequested()
     signal navigationChanged(string navigation)
     signal fileSelected(string fileName, string fileKind)
+    signal favoriteRemovalRequested(string fileName, string filePath)
 
     // 两个上传按钮共用独立的上传面板；新建文件夹沿用同样的异步请求模式。
     onUploadRequested: uploadDialog.open()
     onCreateFolderRequested: uploadManager.createFolder(folderName)
     onRefreshRequested: uploadManager.loadFiles()
+    onFavoriteRemovalRequested:(fileName,filePath)=>uploadManager.removeFavorite(filePath)
+    onCurrentNavChanged: {
+        if (currentNav === "收藏夹")
+            uploadManager.loadFavorites()
+    }
 
     function makeBreadcrumbs(path) {
         var items = [{ name: "我的文件", path: "" }]
@@ -158,6 +170,36 @@ Item {
 
     function matchesSearch(name) {
         return searchKeyword.length === 0 || name.toLowerCase().indexOf(searchKeyword.toLowerCase()) !== -1
+    }
+
+    function matchesFavoriteFilter(kind) {
+        if (favoriteFilter === "文件")
+            return kind !== "folder"
+        if (favoriteFilter === "文件夹")
+            return kind === "folder"
+        return true
+    }
+
+    function matchesFavoriteSearch(name) {
+        return favoriteSearchKeyword.length === 0
+               || name.toLowerCase().indexOf(favoriteSearchKeyword.toLowerCase()) !== -1
+    }
+
+    function removeFavorite(index, name, path) {
+        if (uploadManager.updatingFavorite || path === undefined || path === null
+                || path.toString().length === 0)
+            return
+        if (selectedName === name)
+            clearSelection()
+        // 是否收藏由服务器权威判断；成功响应后再刷新模型，失败时不错误移除界面数据。
+        favoriteRemovalRequested(name, path.toString())
+    }
+
+    function openFavoriteFolder(path) {
+        currentNav = "我的文件"
+        clearSelection()
+        navigationChanged(currentNav)
+        openFolder(path)
     }
 
     // 与客户端和服务端保持一致，提前给出名称错误，服务端仍会进行最终校验。
@@ -414,6 +456,7 @@ Item {
                             cursorShape: Qt.PointingHandCursor
                             onClicked: {
                                 root.currentNav = modelData.title
+                                root.clearSelection()
                                 root.navigationChanged(modelData.title)
                             }
                         }
@@ -606,7 +649,8 @@ Item {
                 // 中央文件区域
                 Item {
                     id: mainArea
-                    width: workspace.width - (root.detailsVisible && workspace.width >= 850 ? 270 : 0)
+                    width: workspace.width - (root.currentNav !== "收藏夹"
+                                              && root.detailsVisible && workspace.width >= 850 ? 270 : 0)
                     height: parent.height
 
                     Behavior on width {
@@ -614,9 +658,11 @@ Item {
                     }
 
                     ColumnLayout {
+                        id: myFilesPage
                         anchors.fill: parent
                         anchors.margins: 22
                         spacing: 13
+                        visible: root.currentNav !== "收藏夹"
 
                         // 顶部标题、搜索和快捷操作
                         RowLayout {
@@ -1690,6 +1736,519 @@ Item {
                             }
                         }
                     }
+
+                    // ====================================================
+                    // 收藏夹：与“我的文件”并列，仅由导航状态切换显示。
+                    // ====================================================
+                    ColumnLayout {
+                        id: favoritesPage
+                        anchors.fill: parent
+                        anchors.margins: 22
+                        spacing: 14
+                        visible: root.currentNav === "收藏夹"
+
+                        // 标题与收藏搜索
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 54
+                            spacing: 12
+
+                            Column {
+                                Layout.fillWidth: true
+                                spacing: 4
+                                Text {
+                                    text: "收藏夹"
+                                    color: root.textDarkColor
+                                    font.pixelSize: 22
+                                    font.weight: Font.DemiBold
+                                }
+                                Text {
+                                    text: "快速访问你标记的重要文件和文件夹"
+                                    color: root.textLightColor
+                                    font.pixelSize: 11
+                                }
+                            }
+
+                            Rectangle {
+                                Layout.preferredWidth: 230
+                                Layout.minimumWidth: 150
+                                Layout.preferredHeight: 36
+                                radius: 8
+                                color: "#FFFFFF"
+                                border.color: favoriteSearchField.activeFocus
+                                              ? root.primaryColor : "#E7ECF4"
+
+                                Row {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 11
+                                    anchors.rightMargin: 9
+                                    spacing: 7
+                                    Text {
+                                        text: "⌕"
+                                        color: "#98A5B9"
+                                        font.pixelSize: 21
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+                                    TextField {
+                                        id: favoriteSearchField
+                                        width: parent.width - 34
+                                        height: parent.height
+                                        placeholderText: "搜索收藏内容"
+                                        color: root.textDarkColor
+                                        font.pixelSize: 11
+                                        selectByMouse: true
+                                        background: Item {}
+                                        onTextChanged: root.favoriteSearchKeyword = text.trim()
+                                    }
+                                }
+                            }
+                        }
+
+                        // 收藏说明横幅
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 88
+                            radius: 11
+                            color: "#F0F3FF"
+                            border.color: "#E3E9FC"
+
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 18
+                                anchors.rightMargin: 18
+                                spacing: 13
+
+                                Rectangle {
+                                    Layout.preferredWidth: 46
+                                    Layout.preferredHeight: 46
+                                    radius: 13
+                                    color: "#E2E9FF"
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "★"
+                                        color: root.primaryColor
+                                        font.pixelSize: 23
+                                    }
+                                }
+
+                                Column {
+                                    Layout.fillWidth: true
+                                    spacing: 5
+                                    Text {
+                                        text: "重要内容，随时找到"
+                                        color: root.textDarkColor
+                                        font.pixelSize: 14
+                                        font.weight: Font.DemiBold
+                                    }
+                                    Text {
+                                        text: "收藏只创建快捷入口，不会复制或移动原文件"
+                                        color: root.textMidColor
+                                        font.pixelSize: 10
+                                    }
+                                }
+
+                                Rectangle {
+                                    Layout.preferredWidth: 86
+                                    Layout.preferredHeight: 30
+                                    radius: 15
+                                    color: "#FFFFFF"
+                                    border.color: "#DFE7FA"
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "☆  " + favoriteListView.count + " 项收藏"
+                                        color: root.primaryColor
+                                        font.pixelSize: 10
+                                        font.weight: Font.DemiBold
+                                    }
+                                }
+                            }
+                        }
+
+                        // 收藏内容列表
+                        Rectangle {
+                            id: favoriteListCard
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            radius: 11
+                            color: "#FFFFFF"
+                            border.color: "#E9EEF6"
+                            border.width: 0   // 取消底层边框
+                            clip: true
+
+                            ColumnLayout {
+                                anchors.fill: parent
+                                spacing: 0
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Layout.preferredHeight: 50
+                                    Layout.leftMargin: 16
+                                    Layout.rightMargin: 14
+                                    spacing: 10
+
+                                    Text {
+                                        text: "收藏内容"
+                                        color: root.textDarkColor
+                                        font.pixelSize: 13
+                                        font.weight: Font.DemiBold
+                                    }
+                                    Text {
+                                        text: favoriteListView.count + " 个项目"
+                                        color: "#A7B2C2"
+                                        font.pixelSize: 10
+                                    }
+                                    Item { Layout.fillWidth: true }
+
+                                    Repeater {
+                                        model: ["全部", "文件", "文件夹"]
+                                        delegate: Item {
+                                            width: 43
+                                            height: 28
+                                            Rectangle {
+                                                anchors.fill: parent
+                                                radius: 6
+                                                color: root.favoriteFilter === modelData ? "#EEF2FF"
+                                                       : (favoriteFilterMouse.containsMouse ? "#F7F9FD" : "transparent")
+                                            }
+                                            Text {
+                                                anchors.centerIn: parent
+                                                text: modelData
+                                                color: root.favoriteFilter === modelData
+                                                       ? root.primaryColor : "#8592A8"
+                                                font.pixelSize: 10
+                                                font.weight: root.favoriteFilter === modelData
+                                                             ? Font.DemiBold : Font.Normal
+                                            }
+                                            MouseArea {
+                                                id: favoriteFilterMouse
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: root.favoriteFilter = modelData
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    height: 1
+                                    color: "#EEF1F6"
+                                }
+
+                                Item {
+                                    Layout.fillWidth: true
+                                    height: 37
+                                    Row {
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        anchors.leftMargin: 16
+                                        anchors.rightMargin: 13
+                                        Text {
+                                            width: Math.max(140, parent.width - 260)
+                                            text: "名称"
+                                            color: "#9AA6B8"
+                                            font.pixelSize: 10
+                                        }
+                                        Text {
+                                            width: 125
+                                            text: "收藏时间"
+                                            color: "#9AA6B8"
+                                            font.pixelSize: 10
+                                        }
+                                        Text {
+                                            width: 80
+                                            text: "大小"
+                                            color: "#9AA6B8"
+                                            font.pixelSize: 10
+                                        }
+                                        Text { width: 55; text: "" }
+                                    }
+                                }
+
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    height: 1
+                                    color: "#F1F3F8"
+                                }
+
+                                Item {
+                                    Layout.fillWidth: true
+                                    Layout.fillHeight: true
+
+                                    ListView {
+                                        id: favoriteListView
+                                        anchors.fill: parent
+                                        clip: true
+                                        model: root.favoritesModelSource
+                                        boundsBehavior: Flickable.StopAtBounds
+                                        ScrollBar.vertical: ScrollBar {
+                                            id: favoriteListScrollBar
+                                            policy: ScrollBar.AsNeeded
+                                        }
+
+                                        delegate: Item {
+                                            id: favoriteRow
+                                            width: favoriteListView.width
+                                            property string filePath: typeof path === "undefined" || path === null
+                                                                      ? "" : path.toString()
+                                            property string collectedAt: typeof favoriteTime === "undefined"
+                                                                         || favoriteTime === null
+                                                                         ? modified : favoriteTime.toString()
+                                            property string favoriteLocation: typeof location === "undefined"
+                                                                              || location === null
+                                                                              ? "我的文件" : location.toString()
+                                            property string serverPreviewType: typeof previewType === "undefined"
+                                                                               || previewType === null
+                                                                               ? "" : previewType.toString()
+                                            property string serverMimeType: typeof mimeType === "undefined"
+                                                                            || mimeType === null ? "" : mimeType.toString()
+                                            property bool rowVisible: root.matchesFavoriteFilter(kind)
+                                                                      && root.matchesFavoriteSearch(name)
+                                            height: rowVisible ? 68 : 0
+                                            visible: rowVisible
+
+                                            Rectangle {
+                                                anchors.fill: parent
+                                                color: root.selectedName === name ? "#F4F7FF"
+                                                       : (favoriteRowMouse.containsMouse ? "#FAFBFE" : "#FFFFFF")
+                                            }
+                                            Rectangle {
+                                                anchors.left: parent.left
+                                                anchors.right: parent.right
+                                                anchors.bottom: parent.bottom
+                                                height: 1
+                                                color: "#F3F5F9"
+                                            }
+
+                                            MouseArea {
+                                                id: favoriteRowMouse
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: root.selectFile(name, kind, modified, size, status, ext)
+                                                onDoubleClicked: {
+                                                    if (kind === "folder") {
+                                                        root.openFavoriteFolder(favoriteRow.filePath)
+                                                        return
+                                                    }
+                                                    root.previewRequested(name, favoriteRow.filePath,
+                                                                          favoriteRow.serverPreviewType,
+                                                                          ext, favoriteRow.serverMimeType)
+                                                }
+                                            }
+
+                                            Row {
+                                                anchors.left: parent.left
+                                                anchors.right: parent.right
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                anchors.leftMargin: 16
+                                                anchors.rightMargin: 13
+
+                                                Row {
+                                                    // 窄窗口下允许名称列继续收缩，不能反向撑宽整行。
+                                                    width: Math.max(0, parent.width - 260)
+                                                    height: 68
+                                                    spacing: 10
+                                                    clip: true
+                                                    Rectangle {
+                                                        width: 38
+                                                        height: 38
+                                                        radius: 9
+                                                        color: kind === "folder" ? "#FFF5E3" : iconBg
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        Text {
+                                                            anchors.centerIn: parent
+                                                            text: kind === "folder" ? "▰" : ext
+                                                            color: kind === "folder" ? "#E9AD4E" : iconColor
+                                                            font.pixelSize: kind === "folder" ? 19 : 9
+                                                            font.weight: Font.DemiBold
+                                                        }
+                                                    }
+                                                    Column {
+                                                        width: Math.max(0, parent.width - 48)
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        spacing: 4
+                                                        Text {
+                                                            width: parent.width
+                                                            text: name
+                                                            color: root.textDarkColor
+                                                            font.pixelSize: 11
+                                                            font.weight: Font.Medium
+                                                            elide: Text.ElideRight
+                                                        }
+                                                        Text {
+                                                            width: parent.width
+                                                            text: favoriteRow.favoriteLocation
+                                                            color: "#AAB4C3"
+                                                            font.pixelSize: 9
+                                                            elide: Text.ElideRight
+                                                        }
+                                                    }
+                                                }
+
+                                                Text {
+                                                    width: 125
+                                                    height: 68
+                                                    text: favoriteRow.collectedAt
+                                                    color: "#8492A8"
+                                                    font.pixelSize: 10
+                                                    verticalAlignment: Text.AlignVCenter
+                                                }
+                                                Text {
+                                                    width: 80
+                                                    height: 68
+                                                    text: size
+                                                    color: "#8492A8"
+                                                    font.pixelSize: 10
+                                                    verticalAlignment: Text.AlignVCenter
+                                                }
+                                                Button {
+                                                    id: removeFavoriteButton
+                                                    width: 36
+                                                    height: 32
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    enabled: !uploadManager.updatingFavorite
+                                                    hoverEnabled: true
+                                                    background: Rectangle {
+                                                        radius: 7
+                                                        color: removeFavoriteButton.hovered ? "#FFF4DF" : "transparent"
+                                                    }
+                                                    contentItem: Text {
+                                                        text: "★"
+                                                        color: removeFavoriteButton.hovered ? "#E8A044" : "#F0B756"
+                                                        font.pixelSize: 17
+                                                        horizontalAlignment: Text.AlignHCenter
+                                                        verticalAlignment: Text.AlignVCenter
+                                                    }
+                                                    onClicked: root.removeFavorite(index, name, favoriteRow.filePath)
+                                                    ToolTip.visible: hovered && enabled
+                                                    ToolTip.text: kind === "folder" ? "取消收藏该文件夹及其全部后代" : "取消收藏"
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    BusyIndicator {
+                                        anchors.centerIn: parent
+                                        width: 30
+                                        height: 30
+                                        running: uploadManager.loadingFavorites
+                                        visible: running
+                                    }
+
+                                    // 无收藏时显示引导，并提供返回文件空间的入口。
+                                    Column {
+                                        anchors.centerIn: parent
+                                        width: Math.min(330, parent.width - 40)
+                                        spacing: 9
+                                        visible: !uploadManager.loadingFavorites && favoriteListView.count === 0
+
+                                        Rectangle {
+                                            width: 64
+                                            height: 64
+                                            radius: 18
+                                            color: "#EEF2FF"
+                                            anchors.horizontalCenter: parent.horizontalCenter
+                                            Text {
+                                                anchors.centerIn: parent
+                                                text: "☆"
+                                                color: root.primaryColor
+                                                font.pixelSize: 32
+                                            }
+                                        }
+                                        Text {
+                                            width: parent.width
+                                            text: "还没有收藏内容"
+                                            color: root.textDarkColor
+                                            font.pixelSize: 14
+                                            font.weight: Font.DemiBold
+                                            horizontalAlignment: Text.AlignHCenter
+                                        }
+                                        Text {
+                                            width: parent.width
+                                            text: "在文件的更多操作中选择“添加到收藏”，重要内容就会集中显示在这里。"
+                                            color: root.textMidColor
+                                            font.pixelSize: 10
+                                            wrapMode: Text.WordWrap
+                                            horizontalAlignment: Text.AlignHCenter
+                                        }
+                                        Button {
+                                            width: 112
+                                            height: 34
+                                            anchors.horizontalCenter: parent.horizontalCenter
+                                            hoverEnabled: true
+                                            background: Rectangle {
+                                                radius: 8
+                                                color: parent.down ? root.primaryDarkColor
+                                                       : parent.hovered ? "#5878F7" : root.primaryColor
+                                            }
+                                            contentItem: Text {
+                                                text: "浏览我的文件"
+                                                color: "#FFFFFF"
+                                                font.pixelSize: 11
+                                                horizontalAlignment: Text.AlignHCenter
+                                                verticalAlignment: Text.AlignVCenter
+                                            }
+                                            onClicked: {
+                                                root.currentNav = "我的文件"
+                                                root.navigationChanged("我的文件")
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    height: 34
+                                    color: "#FCFDFF"
+                                    Rectangle {
+                                        anchors.top: parent.top
+                                        width: parent.width
+                                        height: 1
+                                        color: "#EEF1F6"
+                                    }
+                                    Row {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 16
+                                        anchors.rightMargin: 16
+                                        spacing: 6
+                                        Rectangle {
+                                            width: 6
+                                            height: 6
+                                            radius: 3
+                                            color: root.primaryColor
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                        Text {
+                                            text: "收藏内容与原文件保持关联"
+                                            color: "#9AA7B9"
+                                            font.pixelSize: 9
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                        Item { width: 1; height: 1 }
+                                        Text {
+                                            text: "双击可打开"
+                                            color: "#AAB4C3"
+                                            font.pixelSize: 9
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                    }
+                                }
+                            }
+                            // 最上层边框，防止 ListView 的 delegate 覆盖边框
+                             Rectangle {
+                                 anchors.fill: parent
+                                 radius: parent.radius
+                                 color: "transparent"
+                                 border.color: "#E9EEF6"
+                                 border.width: 1
+                                 antialiasing: true
+                                 z: 100
+                             }
+                        }
+                    }
                 }
 
                 // ========================================================
@@ -1699,7 +2258,7 @@ Item {
                     id: detailsPanel
                     width: 270
                     height: parent.height
-                    visible: root.detailsVisible && workspace.width >= 850
+                    visible: root.currentNav !== "收藏夹" && root.detailsVisible && workspace.width >= 850
                     color: "#FFFFFF"
                     border.color: "#E9EEF6"
                     border.width: 1
@@ -2296,7 +2855,8 @@ Item {
 
         MenuItem {
             id: favoriteMenuItem
-            text: "添加到收藏"
+            text: uploadManager.updatingFavorite ? "正在添加…" : "添加到收藏"
+            enabled: !uploadManager.updatingFavorite
             implicitHeight: 40
             hoverEnabled: true
             leftPadding: 6
@@ -2334,6 +2894,13 @@ Item {
                     font.weight: favoriteMenuItem.hovered ? Font.Medium : Font.Normal
                     elide: Text.ElideRight
                 }
+            }
+
+            onTriggered: {
+                if (rowMenu.filePath.length === 0 || uploadManager.updatingFavorite)
+                    return
+                // 文件夹递归由服务端完成，避免客户端逐项请求造成部分成功。
+                uploadManager.addFavorite(rowMenu.filePath)
             }
         }
 
@@ -2388,6 +2955,12 @@ Item {
                 }
             }
         }
+    }
+
+    // 真实收藏数据由 UploadManager.favoritesLoaded 填充；动态角色保留 favoriteTime/location。
+    ListModel {
+        id: favoritesModel
+        dynamicRoles: true
     }
 
     // 示例文件数据：接入 C++ 后可替换为 QAbstractListModel
@@ -3340,6 +3913,96 @@ Item {
         }
     }
 
+    // 收藏操作结果：成功时显示实际新增/移除数量，失败时保留原列表并提示原因。
+    Dialog {
+        id: favoriteResultDialog
+        anchors.centerIn: parent
+        width: 400
+        height: 206
+        padding: 0
+        modal: true
+        focus: true
+
+        property bool succeeded: true
+        property string message: ""
+
+        function showResult(success, text) {
+            succeeded = success
+            message = text
+            open()
+        }
+
+        Overlay.modal: Rectangle { color: "#66000000" }
+        background: Rectangle {
+            color: "#FFFFFF"
+            radius: 13
+            border.width: 1
+            border.color: "#E4EAF4"
+        }
+
+        contentItem: Item {
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 22
+                spacing: 14
+
+                Row {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Rectangle {
+                        width: 32
+                        height: 32
+                        radius: 9
+                        color: favoriteResultDialog.succeeded ? "#FFF4DF" : "#FCE7E5"
+                        Text {
+                            anchors.centerIn: parent
+                            text: favoriteResultDialog.succeeded ? "★" : "!"
+                            color: favoriteResultDialog.succeeded ? "#E8A044" : "#D76561"
+                            font.pixelSize: 17
+                            font.weight: Font.DemiBold
+                        }
+                    }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: favoriteResultDialog.succeeded ? "收藏操作完成" : "收藏操作失败"
+                        color: root.textDarkColor
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    text: favoriteResultDialog.message
+                    color: root.textMidColor
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignTop
+                }
+
+                Button {
+                    Layout.alignment: Qt.AlignRight
+                    Layout.preferredWidth: 76
+                    Layout.preferredHeight: 34
+                    background: Rectangle {
+                        radius: 8
+                        color: parent.down ? root.primaryDarkColor
+                               : parent.hovered ? "#5878F7" : root.primaryColor
+                    }
+                    contentItem: Text {
+                        text: "确定"
+                        color: "#FFFFFF"
+                        font.pixelSize: 11
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    onClicked: favoriteResultDialog.close()
+                }
+            }
+        }
+    }
+
     // 下载结果提示：成功时展示最终保存路径，失败时展示具体原因。
     DownloadResultDialog {
         id: downloadResultDialog
@@ -3458,6 +4121,36 @@ Item {
             }
         }
 
+        function onFavoritesLoaded(items) {
+            favoritesModel.clear()
+            for (var i = 0; i < items.length; ++i)
+                favoritesModel.append(items[i])
+        }
+
+        function onFavoritesLoadFailed(reason) {
+            console.warn("加载收藏列表失败：" + reason)
+        }
+
+        function onFavoriteAdded(path, addedCount, favoriteCount) {
+            favoriteResultDialog.showResult(true, addedCount > 0
+                ? "收藏成功，新增 " + addedCount + " 个收藏项目。"
+                : "所选内容均已在收藏夹中，没有产生重复收藏。")
+        }
+
+        function onFavoriteAddFailed(path, reason) {
+            favoriteResultDialog.showResult(false, "添加收藏失败：" + reason)
+        }
+
+        function onFavoriteRemoved(path, removedCount, favoriteCount) {
+            favoriteResultDialog.showResult(true, removedCount > 0
+                ? "已取消收藏，共移除 " + removedCount + " 个收藏入口。"
+                : "该项目原本就不在收藏夹中。")
+        }
+
+        function onFavoriteRemoveFailed(path, reason) {
+            favoriteResultDialog.showResult(false, "取消收藏失败：" + reason)
+        }
+
         function onFolderCreated(folderName, folderPath, modifiedText) {
             root.pendingCreatedFolderName = folderName
             root.pendingCreatedFolderPath = folderPath
@@ -3483,6 +4176,7 @@ Item {
 
             // 主动刷新可取消改名前尚未完成的旧列表请求；WebSocket 事件仍用于同步其他客户端。
             uploadManager.loadFiles()
+            uploadManager.loadFavorites()
         }
 
         function onItemRenameFailed(oldPath, reason) {
@@ -3515,6 +4209,7 @@ Item {
             // 移动后原目录和目标目录都可能变化；当前若仍在原目录，立即移除旧项目。
             // WebSocket 事件会继续同步其他客户端，主动刷新则保证离线时也能更新。
             uploadManager.loadFiles()
+            uploadManager.loadFavorites()
         }
 
         function onItemMoveFailed(oldPath, reason) {
@@ -3557,5 +4252,6 @@ Item {
 
     Component.onCompleted: {
         uploadManager.loadFiles()
+        uploadManager.loadFavorites()
     }
 }
