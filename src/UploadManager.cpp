@@ -154,36 +154,38 @@ bool copyUrlToDevice(const QUrl &sourceUrl, QIODevice *target, QString *error)
     return true;
 }
 
-bool validateFolderName(const QString &folderName, QString *error)
+bool validateItemName(const QString &itemName, const QString &itemType, QString *error)
 {
-    if (folderName.isEmpty()) {
-        *error = QStringLiteral("请输入文件夹名称");
+    const QString typeName = itemType.isEmpty()
+        ? QStringLiteral("名称") : itemType + QStringLiteral("名称");
+    if (itemName.isEmpty()) {
+        *error = QStringLiteral("请输入%1").arg(typeName);
         return false;
     }
-    if (folderName.size() > 100) {
-        *error = QStringLiteral("文件夹名称不能超过 100 个字符");
+    if (itemName.size() > 100) {
+        *error = QStringLiteral("%1不能超过 100 个字符").arg(typeName);
         return false;
     }
-    if (folderName == QStringLiteral(".") || folderName == QStringLiteral("..")) {
-        *error = QStringLiteral("文件夹名称不能是“.”或“..”");
+    if (itemName == QStringLiteral(".") || itemName == QStringLiteral("..")) {
+        *error = QStringLiteral("%1不能是“.”或“..”").arg(typeName);
         return false;
     }
 
     const QString invalidCharacters = QStringLiteral("<>:\"/\\|?*");
-    for (const QChar ch : folderName) {
+    for (const QChar ch : itemName) {
         if (ch.unicode() < 32 || invalidCharacters.contains(ch)) {
             *error = QStringLiteral("名称不能包含 < > : \" / \\ | ? * 或控制字符");
             return false;
         }
     }
 
-    // 与 Windows 的命名规则保持一致，避免同步到不同平台后目录不可用。
-    if (folderName.endsWith(QLatin1Char('.')) || folderName.endsWith(QLatin1Char(' '))) {
-        *error = QStringLiteral("文件夹名称不能以句点或空格结尾");
+    // 与 Windows 的命名规则保持一致，避免同步到不同平台后名称不可用。
+    if (itemName.endsWith(QLatin1Char('.')) || itemName.endsWith(QLatin1Char(' '))) {
+        *error = QStringLiteral("%1不能以句点或空格结尾").arg(typeName);
         return false;
     }
 
-    QString baseName = folderName;
+    QString baseName = itemName;
     const int firstDot = baseName.indexOf(QLatin1Char('.'));
     if (firstDot > 0)
         baseName = baseName.left(firstDot);
@@ -199,11 +201,16 @@ bool validateFolderName(const QString &folderName, QString *error)
                                         && baseName.at(3) >= QLatin1Char('1')
                                         && baseName.at(3) <= QLatin1Char('9'));
     if (reservedDeviceName) {
-        *error = QStringLiteral("该名称是系统保留名称，请更换文件夹名称");
+        *error = QStringLiteral("该名称是系统保留名称，请更换%1").arg(typeName);
         return false;
     }
 
     return true;
+}
+
+bool validateFolderName(const QString &folderName, QString *error)
+{
+    return validateItemName(folderName, QStringLiteral("文件夹"), error);
 }
 
 QString displayModified(const QJsonObject &object)
@@ -443,6 +450,20 @@ UploadManager::~UploadManager()
     m_pingTimer.stop();
     m_handshakeTimer.stop();
     m_eventSocket.abort();
+    if (m_moveReply) {
+        QNetworkReply *reply = m_moveReply;
+        m_moveReply = nullptr;
+        disconnect(reply, nullptr, this, nullptr);
+        reply->abort();
+        reply->deleteLater();
+    }
+    if (m_folderChoicesReply) {
+        QNetworkReply *reply = m_folderChoicesReply;
+        m_folderChoicesReply = nullptr;
+        disconnect(reply, nullptr, this, nullptr);
+        reply->abort();
+        reply->deleteLater();
+    }
     resetOpenFile();
     resetDownload();
     resetFolderDownload();
@@ -456,6 +477,9 @@ QString UploadManager::serverUrl() const { return m_serverUrl; }
 bool UploadManager::uploading() const { return m_uploading; }
 bool UploadManager::loadingFiles() const { return m_loadingFiles; }
 bool UploadManager::creatingFolder() const { return m_creatingFolder; }
+bool UploadManager::renaming() const { return m_renaming; }
+bool UploadManager::moving() const { return m_moving; }
+bool UploadManager::loadingFolderChoices() const { return m_loadingFolderChoices; }
 bool UploadManager::openingFile() const { return m_openingFile; }
 bool UploadManager::downloading() const { return m_downloading; }
 int UploadManager::progress() const { return m_progress; }
@@ -984,6 +1008,448 @@ void UploadManager::createFolder(const QString &folderName)
         setCreatingFolder(false);
         setListStatus(QStringLiteral("文件夹“%1”创建成功").arg(actualName));
         emit folderCreated(actualName, folderPath, modifiedText);
+    });
+}
+
+void UploadManager::renameItem(const QString &path, const QString &newName)
+{
+    QString sourcePath;
+    const bool validPath = normalizeCloudPath(path, &sourcePath);
+    const QString reportedPath = validPath ? sourcePath : path;
+    if (m_renaming) {
+        const QString reason = QStringLiteral("正在重命名其他项目，请稍后再试");
+        setListStatus(reason);
+        emit itemRenameFailed(reportedPath, reason);
+        return;
+    }
+
+    if (!validPath || sourcePath.isEmpty()) {
+        const QString reason = QStringLiteral("原文件路径无效或不安全");
+        setListStatus(QStringLiteral("重命名失败：%1").arg(reason));
+        emit itemRenameFailed(reportedPath, reason);
+        return;
+    }
+
+    const QString name = newName.trimmed();
+    QString validationError;
+    if (!validateItemName(name, QString(), &validationError)) {
+        setListStatus(QStringLiteral("重命名失败：%1").arg(validationError));
+        emit itemRenameFailed(sourcePath, validationError);
+        return;
+    }
+
+    const QString oldName = QFileInfo(sourcePath).fileName();
+    if (name == oldName) {
+        setListStatus(QStringLiteral("名称未修改"));
+        emit itemRenamed(sourcePath, sourcePath, name);
+        return;
+    }
+
+    // 与新建文件夹一致，将 /files 映射为同级的 /rename。
+    QUrl endpoint(m_fileListUrl);
+    if (!endpoint.isValid()
+        || (endpoint.scheme() != QStringLiteral("http")
+            && endpoint.scheme() != QStringLiteral("https"))) {
+        const QString reason = QStringLiteral("文件服务地址无效：请填写 http 或 https 地址");
+        setListStatus(reason);
+        emit itemRenameFailed(sourcePath, reason);
+        return;
+    }
+
+    QString basePath = endpoint.path();
+    const int lastSlash = basePath.lastIndexOf(QLatin1Char('/'));
+    basePath = lastSlash >= 0 ? basePath.left(lastSlash + 1) : QStringLiteral("/");
+    endpoint.setPath(basePath + QStringLiteral("rename"));
+    endpoint.setQuery(QUrlQuery());
+    endpoint.setFragment(QString());
+
+    QNetworkRequest request(endpoint);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setRawHeader(QByteArrayLiteral("Content-Type"),
+                         QByteArrayLiteral("application/json; charset=utf-8"));
+    request.setTransferTimeout(30000);
+
+    const QJsonObject payload{
+        {QStringLiteral("path"), sourcePath},
+        {QStringLiteral("newName"), name}
+    };
+
+    setRenaming(true);
+    setListStatus(QStringLiteral("正在将“%1”重命名为“%2”…").arg(oldName, name));
+    QNetworkReply *reply = m_network.post(
+        request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
+    m_renameReply = reply;
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply, sourcePath, oldName, name]() {
+        if (reply != m_renameReply) {
+            reply->deleteLater();
+            return;
+        }
+
+        m_renameReply = nullptr;
+        const QByteArray responseBody = reply->readAll();
+        const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString networkError = reply->errorString();
+        const bool hasNetworkError = reply->error() != QNetworkReply::NoError;
+        reply->deleteLater();
+
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(responseBody, &parseError);
+        const bool hasJsonObject = parseError.error == QJsonParseError::NoError
+                                   && document.isObject();
+        const QJsonObject responseObject = hasJsonObject ? document.object() : QJsonObject();
+        const QString serverMessage = responseObject.value(QStringLiteral("message")).toString();
+
+        QString error;
+        if (hasNetworkError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = serverMessage.isEmpty() ? networkError : serverMessage;
+            if (error.trimmed().isEmpty())
+                error = QStringLiteral("服务器返回异常响应");
+            if (serverMessage.isEmpty() && httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        } else if (!responseBody.isEmpty() && !hasJsonObject) {
+            error = QStringLiteral("服务器返回的重命名结果不是有效 JSON 对象");
+        } else if (responseObject.contains(QStringLiteral("success"))
+                   && !responseObject.value(QStringLiteral("success")).toBool()) {
+            error = serverMessage.isEmpty()
+                ? QStringLiteral("服务器未能完成重命名") : serverMessage;
+        }
+
+        if (!error.isEmpty()) {
+            setRenaming(false);
+            setListStatus(QStringLiteral("重命名失败：%1").arg(error));
+            emit itemRenameFailed(sourcePath, error);
+            return;
+        }
+
+        const QString actualName = responseObject.value(QStringLiteral("name")).toString(name);
+        QString newPath = responseObject.value(QStringLiteral("path")).toString();
+        if (newPath.isEmpty())
+            newPath = responseObject.value(QStringLiteral("newPath")).toString();
+        if (newPath.isEmpty()) {
+            const int pathSeparator = sourcePath.lastIndexOf(QLatin1Char('/'));
+            const QString parentPath = pathSeparator >= 0
+                ? sourcePath.left(pathSeparator) : QString();
+            newPath = parentPath.isEmpty()
+                ? actualName : parentPath + QLatin1Char('/') + actualName;
+        }
+
+        setRenaming(false);
+        setListStatus(QStringLiteral("“%1”已重命名为“%2”").arg(oldName, actualName));
+        emit itemRenamed(sourcePath, newPath, actualName);
+    });
+}
+
+void UploadManager::moveItem(const QString &path, const QString &destinationPath)
+{
+    QString sourcePath;
+    QString targetDirectory;
+    const bool validSource = normalizeCloudPath(path, &sourcePath);
+    const bool validDestination = normalizeCloudPath(destinationPath, &targetDirectory);
+    const QString reportedPath = validSource ? sourcePath : path;
+
+    if (m_moving) {
+        const QString reason = QStringLiteral("正在移动其他项目，请稍后再试");
+        setListStatus(reason);
+        emit itemMoveFailed(reportedPath, reason);
+        return;
+    }
+    if (!validSource || sourcePath.isEmpty()) {
+        const QString reason = QStringLiteral("原文件或文件夹路径无效或不安全");
+        setListStatus(QStringLiteral("移动失败：%1").arg(reason));
+        emit itemMoveFailed(reportedPath, reason);
+        return;
+    }
+    if (!validDestination) {
+        const QString reason = QStringLiteral("目标文件夹路径无效或不安全");
+        setListStatus(QStringLiteral("移动失败：%1").arg(reason));
+        emit itemMoveFailed(sourcePath, reason);
+        return;
+    }
+
+    // 目标不能是源文件夹自身或其子孙后代；服务端会再次做权威校验。
+    if (targetDirectory == sourcePath
+        || targetDirectory.startsWith(sourcePath + QLatin1Char('/'))) {
+        const QString reason = QStringLiteral("不能将文件夹移动到自身或其子文件夹中");
+        setListStatus(QStringLiteral("移动失败：%1").arg(reason));
+        emit itemMoveFailed(sourcePath, reason);
+        return;
+    }
+
+    const int pathSeparator = sourcePath.lastIndexOf(QLatin1Char('/'));
+    const QString sourceParent = pathSeparator >= 0
+        ? sourcePath.left(pathSeparator) : QString();
+    const QString itemName = pathSeparator >= 0
+        ? sourcePath.mid(pathSeparator + 1) : sourcePath;
+    if (targetDirectory == sourceParent) {
+        setListStatus(QStringLiteral("“%1”已在目标文件夹中").arg(itemName));
+        emit itemMoved(sourcePath, sourcePath, targetDirectory);
+        return;
+    }
+
+    QUrl endpoint(m_fileListUrl);
+    if (!endpoint.isValid()
+        || (endpoint.scheme() != QStringLiteral("http")
+            && endpoint.scheme() != QStringLiteral("https"))) {
+        const QString reason = QStringLiteral("文件服务地址无效：请填写 http 或 https 地址");
+        setListStatus(reason);
+        emit itemMoveFailed(sourcePath, reason);
+        return;
+    }
+
+    QString basePath = endpoint.path();
+    const int lastSlash = basePath.lastIndexOf(QLatin1Char('/'));
+    basePath = lastSlash >= 0 ? basePath.left(lastSlash + 1) : QStringLiteral("/");
+    endpoint.setPath(basePath + QStringLiteral("move"));
+    endpoint.setQuery(QUrlQuery());
+    endpoint.setFragment(QString());
+
+    QNetworkRequest request(endpoint);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setRawHeader(QByteArrayLiteral("Content-Type"),
+                         QByteArrayLiteral("application/json; charset=utf-8"));
+    request.setTransferTimeout(120000);
+
+    const QJsonObject payload{
+        {QStringLiteral("path"), sourcePath},
+        {QStringLiteral("destinationPath"), targetDirectory}
+    };
+
+    setMoving(true);
+    setListStatus(QStringLiteral("正在移动“%1”…").arg(itemName));
+    QNetworkReply *reply = m_network.post(
+        request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
+    m_moveReply = reply;
+
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, sourcePath, targetDirectory, itemName]() {
+        if (reply != m_moveReply) {
+            reply->deleteLater();
+            return;
+        }
+
+        m_moveReply = nullptr;
+        const QByteArray responseBody = reply->readAll();
+        const int httpStatus = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString networkError = reply->errorString();
+        const bool hasNetworkError = reply->error() != QNetworkReply::NoError;
+        reply->deleteLater();
+
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(responseBody, &parseError);
+        const bool hasJsonObject = parseError.error == QJsonParseError::NoError
+                                   && document.isObject();
+        const QJsonObject responseObject = hasJsonObject ? document.object() : QJsonObject();
+        const QString serverMessage = responseObject.value(QStringLiteral("message")).toString();
+
+        QString error;
+        if (hasNetworkError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = serverMessage.isEmpty() ? networkError : serverMessage;
+            if (error.trimmed().isEmpty())
+                error = QStringLiteral("服务器返回异常响应");
+            if (serverMessage.isEmpty() && httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        } else if (!responseBody.isEmpty() && !hasJsonObject) {
+            error = QStringLiteral("服务器返回的移动结果不是有效 JSON 对象");
+        } else if (responseObject.contains(QStringLiteral("success"))
+                   && !responseObject.value(QStringLiteral("success")).toBool()) {
+            error = serverMessage.isEmpty()
+                ? QStringLiteral("服务器未能完成移动") : serverMessage;
+        }
+
+        if (!error.isEmpty()) {
+            setMoving(false);
+            setListStatus(QStringLiteral("移动失败：%1").arg(error));
+            emit itemMoveFailed(sourcePath, error);
+            return;
+        }
+
+        QString actualDestination = responseObject.value(
+            QStringLiteral("destinationPath")).toString(targetDirectory);
+        QString normalizedDestination;
+        if (!normalizeCloudPath(actualDestination, &normalizedDestination))
+            normalizedDestination = targetDirectory;
+        actualDestination = normalizedDestination;
+
+        QString newPath = responseObject.value(QStringLiteral("newPath")).toString();
+        if (newPath.isEmpty())
+            newPath = responseObject.value(QStringLiteral("path")).toString();
+        if (newPath.isEmpty()) {
+            newPath = actualDestination.isEmpty()
+                ? itemName : actualDestination + QLatin1Char('/') + itemName;
+        }
+        QString normalizedNewPath;
+        if (!normalizeCloudPath(newPath, &normalizedNewPath) || normalizedNewPath.isEmpty()) {
+            const QString reason = QStringLiteral("服务器返回的新路径无效");
+            setMoving(false);
+            setListStatus(QStringLiteral("移动失败：%1").arg(reason));
+            emit itemMoveFailed(sourcePath, reason);
+            return;
+        }
+        newPath = normalizedNewPath;
+
+        setMoving(false);
+        const QString location = actualDestination.isEmpty()
+            ? QStringLiteral("我的文件") : actualDestination;
+        setListStatus(QStringLiteral("“%1”已移动到“%2”").arg(itemName, location));
+        emit itemMoved(sourcePath, newPath, actualDestination);
+    });
+}
+
+void UploadManager::loadFolderChoices(const QString &folderPath)
+{
+    // 目标目录浏览以最后一次操作为准，避免旧响应覆盖新目录。
+    if (m_folderChoicesReply) {
+        QNetworkReply *oldReply = m_folderChoicesReply;
+        m_folderChoicesReply = nullptr;
+        disconnect(oldReply, nullptr, this, nullptr);
+        oldReply->abort();
+        oldReply->deleteLater();
+    }
+
+    QString requestedPath;
+    if (!normalizeCloudPath(folderPath, &requestedPath)) {
+        const QString reason = QStringLiteral("目录路径无效或不安全");
+        setLoadingFolderChoices(false);
+        emit folderChoicesLoadFailed(folderPath, reason);
+        return;
+    }
+
+    QUrl endpoint(m_fileListUrl);
+    if (!endpoint.isValid()
+        || (endpoint.scheme() != QStringLiteral("http")
+            && endpoint.scheme() != QStringLiteral("https"))) {
+        const QString reason = QStringLiteral("文件服务地址无效：请填写 http 或 https 地址");
+        setLoadingFolderChoices(false);
+        emit folderChoicesLoadFailed(requestedPath, reason);
+        return;
+    }
+
+    QString basePath = endpoint.path();
+    const int lastSlash = basePath.lastIndexOf(QLatin1Char('/'));
+    basePath = lastSlash >= 0 ? basePath.left(lastSlash + 1) : QStringLiteral("/");
+    endpoint.setPath(basePath + QStringLiteral("folders"));
+    endpoint.setFragment(QString());
+    QUrlQuery query(endpoint);
+    query.removeQueryItem(QStringLiteral("path"));
+    if (!requestedPath.isEmpty())
+        query.addQueryItem(QStringLiteral("path"), requestedPath);
+    endpoint.setQuery(query);
+
+    QNetworkRequest request(endpoint);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setRawHeader(QByteArrayLiteral("Cache-Control"), QByteArrayLiteral("no-cache"));
+    request.setTransferTimeout(30000);
+
+    setLoadingFolderChoices(true);
+    QNetworkReply *reply = m_network.get(request);
+    m_folderChoicesReply = reply;
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply, requestedPath]() {
+        if (reply != m_folderChoicesReply) {
+            reply->deleteLater();
+            return;
+        }
+
+        m_folderChoicesReply = nullptr;
+        const QByteArray responseBody = reply->readAll();
+        const int httpStatus = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString networkError = reply->errorString();
+        const bool hasNetworkError = reply->error() != QNetworkReply::NoError;
+        reply->deleteLater();
+
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(responseBody, &parseError);
+        const bool hasJsonObject = parseError.error == QJsonParseError::NoError
+                                   && document.isObject();
+        QJsonObject responseObject = hasJsonObject ? document.object() : QJsonObject();
+        const QString serverMessage = responseObject.value(QStringLiteral("message")).toString();
+
+        QString error;
+        if (hasNetworkError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = serverMessage.isEmpty() ? networkError : serverMessage;
+            if (error.trimmed().isEmpty())
+                error = QStringLiteral("服务器返回异常响应");
+            if (serverMessage.isEmpty() && httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        } else if (!hasJsonObject) {
+            error = QStringLiteral("服务器返回的目录列表不是有效 JSON 对象");
+        } else if (responseObject.contains(QStringLiteral("success"))
+                   && !responseObject.value(QStringLiteral("success")).toBool()) {
+            error = serverMessage.isEmpty()
+                ? QStringLiteral("服务器未能返回目录列表") : serverMessage;
+        }
+
+        if (!error.isEmpty()) {
+            setLoadingFolderChoices(false);
+            emit folderChoicesLoadFailed(requestedPath, error);
+            return;
+        }
+
+        if (responseObject.value(QStringLiteral("data")).isObject())
+            responseObject = responseObject.value(QStringLiteral("data")).toObject();
+        QJsonArray entries = responseObject.value(QStringLiteral("folders")).toArray();
+        if (entries.isEmpty() && responseObject.value(QStringLiteral("items")).isArray())
+            entries = responseObject.value(QStringLiteral("items")).toArray();
+        if (!responseObject.value(QStringLiteral("folders")).isArray()
+            && !responseObject.value(QStringLiteral("items")).isArray()) {
+            setLoadingFolderChoices(false);
+            emit folderChoicesLoadFailed(requestedPath,
+                                         QStringLiteral("目录列表响应缺少 folders 数组"));
+            return;
+        }
+
+        QVariantList folders;
+        const QString directoryPrefix = requestedPath.isEmpty()
+            ? QString() : requestedPath + QLatin1Char('/');
+        for (const QJsonValue &value : entries) {
+            if (!value.isObject())
+                continue;
+
+            QJsonObject object = value.toObject();
+            object.insert(QStringLiteral("kind"), QStringLiteral("folder"));
+            const QString responseName = object.value(QStringLiteral("name")).toString();
+            if (object.value(QStringLiteral("path")).toString().isEmpty()
+                && !responseName.isEmpty()) {
+                object.insert(QStringLiteral("path"), requestedPath.isEmpty()
+                              ? responseName
+                              : requestedPath + QLatin1Char('/') + responseName);
+            }
+            QVariantMap folder = makeFileItem(object);
+            QString name = folder.value(QStringLiteral("name")).toString();
+            QString childPath = folder.value(QStringLiteral("path")).toString();
+            if (childPath.isEmpty() && !name.isEmpty()) {
+                childPath = requestedPath.isEmpty()
+                    ? name : requestedPath + QLatin1Char('/') + name;
+            }
+
+            QString normalizedChildPath;
+            if (!normalizeCloudPath(childPath, &normalizedChildPath)
+                || normalizedChildPath.isEmpty()) {
+                continue;
+            }
+            if (!directoryPrefix.isEmpty()
+                && !normalizedChildPath.startsWith(directoryPrefix)) {
+                continue;
+            }
+            const QString directName = directoryPrefix.isEmpty()
+                ? normalizedChildPath : normalizedChildPath.mid(directoryPrefix.size());
+            if (directName.isEmpty() || directName.contains(QLatin1Char('/')))
+                continue;
+
+            folder.insert(QStringLiteral("name"), directName);
+            folder.insert(QStringLiteral("path"), normalizedChildPath);
+            folder.insert(QStringLiteral("kind"), QStringLiteral("folder"));
+            folders.append(folder);
+        }
+
+        setLoadingFolderChoices(false);
+        emit folderChoicesLoaded(requestedPath, folders);
     });
 }
 
@@ -2352,6 +2818,30 @@ void UploadManager::setCreatingFolder(bool value)
         return;
     m_creatingFolder = value;
     emit creatingFolderChanged();
+}
+
+void UploadManager::setRenaming(bool value)
+{
+    if (m_renaming == value)
+        return;
+    m_renaming = value;
+    emit renamingChanged();
+}
+
+void UploadManager::setMoving(bool value)
+{
+    if (m_moving == value)
+        return;
+    m_moving = value;
+    emit movingChanged();
+}
+
+void UploadManager::setLoadingFolderChoices(bool value)
+{
+    if (m_loadingFolderChoices == value)
+        return;
+    m_loadingFolderChoices = value;
+    emit loadingFolderChoicesChanged();
 }
 
 void UploadManager::setOpeningFile(bool value)

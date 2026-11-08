@@ -12,7 +12,7 @@ import FileSyncComponents 1.0
  *
  * 文件列表使用本地 ListModel；上传、列表和预览通过 C++ UploadManager 接入 HTTP 服务。
  * 服务器文件变化通过 WebSocket 主动推送，客户端自动刷新当前目录并在断线后重连。
- * 行菜单的打开和下载由 UploadManager 完成；分享、删除、刷新和立即同步仍通过 signals 暴露给业务层。
+ * 行菜单的打开、下载、重命名和移动由 UploadManager 完成；分享、删除、刷新和立即同步仍通过 signals 暴露给业务层。
  */
 Item {
     id: root
@@ -50,6 +50,7 @@ Item {
     property string selectedExt: ""
     property string pendingCreatedFolderName: ""
     property string pendingCreatedFolderPath: ""
+    property string pendingRenamedPath: ""
     property bool refreshAfterCurrentFileLoad: false
     property var breadcrumbItems: root.makeBreadcrumbs(uploadManager.currentPath)
     property string currentLocationText: uploadManager.currentPath.length === 0
@@ -155,14 +156,15 @@ Item {
     }
 
     // 与客户端和服务端保持一致，提前给出名称错误，服务端仍会进行最终校验。
-    function validateFolderName(folderName) {
-        var name = folderName === undefined || folderName === null ? "" : folderName.toString().trim()
+    function validateItemName(itemName, itemKind) {
+        var name = itemName === undefined || itemName === null ? "" : itemName.toString().trim()
+        var typeName = itemKind === "folder" ? "文件夹名称" : "文件名称"
         if (name.length === 0)
-            return "请输入文件夹名称"
+            return "请输入" + typeName
         if (name.length > 100)
-            return "文件夹名称不能超过 100 个字符"
+            return typeName + "不能超过 100 个字符"
         if (name === "." || name === "..")
-            return "文件夹名称不能是“.”或“..”"
+            return typeName + "不能是“.”或“..”"
 
         var invalidCharacters = "<>:\"/\\|?*"
         for (var i = 0; i < name.length; ++i) {
@@ -170,7 +172,7 @@ Item {
                 return "名称不能包含 < > : \" / \\ | ? * 或控制字符"
         }
         if (name.charAt(name.length - 1) === "." || name.charAt(name.length - 1) === " ")
-            return "文件夹名称不能以句点或空格结尾"
+            return typeName + "不能以句点或空格结尾"
 
         var baseName = name
         var firstDot = baseName.indexOf(".")
@@ -179,9 +181,13 @@ Item {
         baseName = baseName.toUpperCase()
         if (["CON", "PRN", "AUX", "NUL"].indexOf(baseName) !== -1
                 || /^(COM|LPT)[1-9]$/.test(baseName))
-            return "该名称是系统保留名称，请更换文件夹名称"
+            return "该名称是系统保留名称，请更换" + typeName
 
         return ""
+    }
+
+    function validateFolderName(folderName) {
+        return validateItemName(folderName, "folder")
     }
 
     function isImageExtension(extension) {
@@ -2180,7 +2186,8 @@ Item {
 
         MenuItem {
             id: renameMenuItem
-            text: "重命名"
+            text: uploadManager.renaming ? "正在重命名…" : "重命名"
+            enabled: !uploadManager.renaming
             implicitHeight: 40
             hoverEnabled: true
             leftPadding: 6
@@ -2219,11 +2226,18 @@ Item {
                     elide: Text.ElideRight
                 }
             }
+
+            onTriggered: {
+                if (rowMenu.filePath.length === 0)
+                    return
+                renameDialog.openFor(rowMenu.filePath, rowMenu.fileName, rowMenu.fileKind)
+            }
         }
 
         MenuItem {
             id: moveMenuItem
-            text: "移动到"
+            text: uploadManager.moving ? "正在移动…" : "移动到"
+            enabled: !uploadManager.moving
             implicitHeight: 40
             hoverEnabled: true
             leftPadding: 6
@@ -2261,11 +2275,12 @@ Item {
                     font.weight: moveMenuItem.hovered ? Font.Medium : Font.Normal
                     elide: Text.ElideRight
                 }
-                Text {
-                    text: "›"
-                    color: "#B0BACA"
-                    font.pixelSize: 16
-                }
+            }
+
+            onTriggered: {
+                if (rowMenu.filePath.length === 0)
+                    return
+                moveDialog.openFor(rowMenu.filePath, rowMenu.fileName, rowMenu.fileKind)
             }
         }
 
@@ -2665,6 +2680,656 @@ Item {
         }
     }
 
+    // 重命名弹窗：文件和文件夹共用，网络请求期间禁止重复提交或关闭。
+    Dialog {
+        id: renameDialog
+        anchors.centerIn: parent
+        width: 400
+        height: 282
+        padding: 0
+        modal: true
+        focus: true
+        closePolicy: uploadManager.renaming ? Popup.NoAutoClose : Popup.CloseOnEscape
+
+        property string originalPath: ""
+        property string originalName: ""
+        property string itemKind: "file"
+        property string errorText: ""
+
+        function openFor(path, name, kind) {
+            originalPath = path === undefined || path === null ? "" : path.toString()
+            originalName = name === undefined || name === null ? "" : name.toString()
+            itemKind = kind === "folder" ? "folder" : "file"
+            errorText = ""
+            open()
+        }
+
+        function submit() {
+            if (uploadManager.renaming || originalPath.length === 0)
+                return
+
+            var newName = renameNameField.text.trim()
+            var validationError = root.validateItemName(newName, itemKind)
+            if (validationError.length > 0) {
+                errorText = validationError
+                renameNameField.forceActiveFocus()
+                return
+            }
+
+            if (newName === originalName) {
+                close()
+                return
+            }
+
+            errorText = ""
+            uploadManager.renameItem(originalPath, newName)
+        }
+
+        onOpened: {
+            renameNameField.text = originalName
+            errorText = ""
+            renameNameField.forceActiveFocus()
+
+            // 文件仅选中主名称，保留扩展名；无扩展名、点开头文件和文件夹则全选。
+            var dotIndex = itemKind === "file" ? originalName.lastIndexOf(".") : -1
+            if (dotIndex > 0)
+                renameNameField.select(0, dotIndex)
+            else
+                renameNameField.selectAll()
+        }
+
+        Overlay.modal: Rectangle {
+            color: "#66000000"
+        }
+
+        background: Rectangle {
+            color: "#FFFFFF"
+            radius: 13
+            border.width: 1
+            border.color: "#E4EAF4"
+            antialiasing: true
+        }
+
+        contentItem: Item {
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 22
+                spacing: 11
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 30
+                    spacing: 10
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: renameDialog.itemKind === "folder" ? "重命名文件夹" : "重命名文件"
+                        color: root.textDarkColor
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        verticalAlignment: Text.AlignVCenter
+                    }
+
+                    Button {
+                        id: renameDialogCloseButton
+                        Layout.preferredWidth: 28
+                        Layout.preferredHeight: 28
+                        enabled: !uploadManager.renaming
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 6
+                            color: renameDialogCloseButton.hovered ? "#F2F5FA" : "transparent"
+                        }
+                        contentItem: Text {
+                            text: "×"
+                            color: renameDialogCloseButton.enabled ? "#8D9AB0" : "#C8CFDA"
+                            font.pixelSize: 19
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onClicked: renameDialog.close()
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: "为“" + renameDialog.originalName + "”输入新名称。"
+                    color: root.textMidColor
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                    elide: Text.ElideMiddle
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 42
+                    radius: 8
+                    color: renameNameField.activeFocus ? "#FAFBFF" : "#FFFFFF"
+                    border.width: 1
+                    border.color: renameDialog.errorText.length > 0 ? "#DF827C"
+                                  : (renameNameField.activeFocus ? root.primaryColor : "#DDE5F2")
+
+                    TextField {
+                        id: renameNameField
+                        anchors.fill: parent
+                        anchors.leftMargin: 12
+                        anchors.rightMargin: 12
+                        color: root.textDarkColor
+                        font.pixelSize: 12
+                        selectByMouse: true
+                        selectedTextColor: "#FFFFFF"
+                        selectionColor: root.primaryColor
+                        verticalAlignment: TextInput.AlignVCenter
+                        background: Item {}
+                        onTextChanged: renameDialog.errorText = ""
+                        onAccepted: renameDialog.submit()
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 34
+                    text: renameDialog.errorText.length > 0
+                          ? renameDialog.errorText
+                          : "名称需符合系统文件命名规则，最多 100 个字符。"
+                    color: renameDialog.errorText.length > 0 ? "#D76D68" : "#9AA6B8"
+                    font.pixelSize: 10
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignTop
+                }
+
+                Item { Layout.fillHeight: true }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 36
+                    spacing: 9
+
+                    Item { Layout.fillWidth: true }
+
+                    Button {
+                        id: cancelRenameButton
+                        Layout.preferredWidth: 76
+                        Layout.preferredHeight: 36
+                        enabled: !uploadManager.renaming
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 8
+                            color: cancelRenameButton.hovered ? "#F4F6FA" : "#FFFFFF"
+                            border.color: "#DFE6F1"
+                        }
+                        contentItem: Text {
+                            text: "取消"
+                            color: cancelRenameButton.enabled ? "#596981" : "#A7B2C2"
+                            font.pixelSize: 11
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onClicked: renameDialog.close()
+                    }
+
+                    Button {
+                        id: confirmRenameButton
+                        Layout.preferredWidth: 76
+                        Layout.preferredHeight: 36
+                        enabled: !uploadManager.renaming
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 8
+                            color: !confirmRenameButton.enabled ? "#AAB8E8"
+                                   : confirmRenameButton.down ? root.primaryDarkColor
+                                   : confirmRenameButton.hovered ? "#5878F7" : root.primaryColor
+                        }
+                        contentItem: Item {
+                            implicitWidth: renameContentRow.implicitWidth
+                            implicitHeight: renameContentRow.implicitHeight
+
+                            Row {
+                                id: renameContentRow
+                                anchors.centerIn: parent
+                                spacing: 6
+
+                                BusyIndicator {
+                                    width: 16
+                                    height: 16
+                                    running: uploadManager.renaming
+                                    visible: running
+                                }
+
+                                Text {
+                                    text: uploadManager.renaming ? "保存中…" : "保存"
+                                    color: "#FFFFFF"
+                                    font.pixelSize: 11
+                                    font.weight: Font.DemiBold
+                                    height: 16
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                            }
+                        }
+                        onClicked: renameDialog.submit()
+                    }
+                }
+            }
+        }
+    }
+
+    // 移动弹窗：独立浏览云端目录，不改变主界面的 currentPath。
+    Dialog {
+        id: moveDialog
+        anchors.centerIn: parent
+        width: 540
+        height: 540
+        padding: 0
+        modal: true
+        focus: true
+        closePolicy: uploadManager.moving ? Popup.NoAutoClose : Popup.CloseOnEscape
+
+        property string sourcePath: ""
+        property string sourceName: ""
+        property string itemKind: "file"
+        property string currentFolderPath: ""
+        property var folderItems: []
+        property string errorText: ""
+        property bool directoryLoaded: false
+
+        function isSourceOrDescendant(path) {
+            if (itemKind !== "folder" || sourcePath.length === 0)
+                return false
+            var value = path === undefined || path === null ? "" : path.toString()
+            return value === sourcePath || value.indexOf(sourcePath + "/") === 0
+        }
+
+        function openFor(path, name, kind) {
+            sourcePath = path === undefined || path === null ? "" : path.toString()
+            sourceName = name === undefined || name === null ? "" : name.toString()
+            itemKind = kind === "folder" ? "folder" : "file"
+            var separator = sourcePath.lastIndexOf("/")
+            currentFolderPath = separator >= 0 ? sourcePath.substring(0, separator) : ""
+            folderItems = []
+            errorText = ""
+            directoryLoaded = false
+            open()
+        }
+
+        function navigate(path) {
+            if (uploadManager.moving)
+                return
+
+            var targetPath = path === undefined || path === null ? "" : path.toString()
+            if (isSourceOrDescendant(targetPath)) {
+                errorText = "不能将文件夹移动到自身或其子文件夹中"
+                return
+            }
+
+            currentFolderPath = targetPath
+            folderItems = []
+            errorText = ""
+            directoryLoaded = false
+            uploadManager.loadFolderChoices(targetPath)
+        }
+
+        function submit() {
+            if (uploadManager.moving || uploadManager.loadingFolderChoices
+                    || !directoryLoaded || sourcePath.length === 0)
+                return
+            if (isSourceOrDescendant(currentFolderPath)) {
+                errorText = "不能将文件夹移动到自身或其子文件夹中"
+                return
+            }
+
+            errorText = ""
+            uploadManager.moveItem(sourcePath, currentFolderPath)
+        }
+
+        onOpened: uploadManager.loadFolderChoices(currentFolderPath)
+
+        Overlay.modal: Rectangle {
+            color: "#66000000"
+        }
+
+        background: Rectangle {
+            color: "#FFFFFF"
+            radius: 13
+            border.width: 1
+            border.color: "#E4EAF4"
+            antialiasing: true
+        }
+
+        contentItem: Item {
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 22
+                spacing: 11
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 30
+                    spacing: 10
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: moveDialog.itemKind === "folder" ? "移动文件夹" : "移动文件"
+                        color: root.textDarkColor
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        verticalAlignment: Text.AlignVCenter
+                    }
+
+                    Button {
+                        id: moveDialogCloseButton
+                        Layout.preferredWidth: 28
+                        Layout.preferredHeight: 28
+                        enabled: !uploadManager.moving
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 6
+                            color: moveDialogCloseButton.hovered ? "#F2F5FA" : "transparent"
+                        }
+                        contentItem: Text {
+                            text: "×"
+                            color: moveDialogCloseButton.enabled ? "#8D9AB0" : "#C8CFDA"
+                            font.pixelSize: 19
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onClicked: moveDialog.close()
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    text: "将“" + moveDialog.sourceName + "”移动到以下位置。原名称保持不变。"
+                    color: root.textMidColor
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                    elide: Text.ElideMiddle
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 46
+                    radius: 8
+                    color: "#F5F7FF"
+                    border.color: "#E1E7F7"
+
+                    Row {
+                        anchors.fill: parent
+                        anchors.leftMargin: 12
+                        anchors.rightMargin: 12
+                        spacing: 9
+
+                        Text {
+                            text: "▰"
+                            color: "#E9AD4E"
+                            font.pixelSize: 17
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        Column {
+                            width: parent.width - 30
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: 2
+                            Text {
+                                width: parent.width
+                                text: "目标位置"
+                                color: "#8D99AE"
+                                font.pixelSize: 9
+                            }
+                            Text {
+                                width: parent.width
+                                text: moveDialog.currentFolderPath.length === 0
+                                      ? "我的文件" : moveDialog.currentFolderPath
+                                color: root.textDarkColor
+                                font.pixelSize: 11
+                                font.weight: Font.Medium
+                                elide: Text.ElideMiddle
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 32
+                    color: "transparent"
+
+                    ListView {
+                        id: moveBreadcrumbView
+                        anchors.fill: parent
+                        orientation: ListView.Horizontal
+                        model: root.makeBreadcrumbs(moveDialog.currentFolderPath)
+                        spacing: 4
+                        clip: true
+                        interactive: contentWidth > width
+                        boundsBehavior: Flickable.StopAtBounds
+                        highlight: null
+
+                        function revealLast() {
+                            Qt.callLater(function() {
+                                if (count > 0 && contentWidth > width)
+                                    positionViewAtIndex(count - 1, ListView.End)
+                                else
+                                    contentX = 0
+                            })
+                        }
+                        onModelChanged: revealLast()
+
+                        delegate: Item {
+                            width: moveBreadcrumbRow.implicitWidth
+                            height: moveBreadcrumbView.height
+
+                            Row {
+                                id: moveBreadcrumbRow
+                                height: parent.height
+                                spacing: 4
+                                Text {
+                                    visible: index > 0
+                                    text: "›"
+                                    color: "#B5BFD0"
+                                    font.pixelSize: 13
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                Text {
+                                    text: modelData.name
+                                    color: moveBreadcrumbMouse.containsMouse
+                                           ? root.primaryColor : "#64738B"
+                                    font.pixelSize: 10
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+                            MouseArea {
+                                id: moveBreadcrumbMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                enabled: !uploadManager.moving
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: moveDialog.navigate(modelData.path)
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: 180
+                    radius: 9
+                    color: "#FBFCFE"
+                    border.color: "#E4EAF3"
+                    clip: true
+
+                    ListView {
+                        id: moveFolderView
+                        anchors.fill: parent
+                        anchors.margins: 5
+                        model: moveDialog.folderItems
+                        spacing: 2
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                        delegate: Rectangle {
+                            id: moveFolderRow
+                            width: moveFolderView.width
+                            height: 46
+                            radius: 7
+                            property bool forbidden: moveDialog.isSourceOrDescendant(modelData.path)
+                            color: forbidden ? "#FAFBFC"
+                                 : moveFolderMouse.containsMouse ? "#EEF2FF" : "transparent"
+
+                            Row {
+                                anchors.fill: parent
+                                anchors.leftMargin: 10
+                                anchors.rightMargin: 10
+                                spacing: 10
+
+                                Rectangle {
+                                    width: 30
+                                    height: 30
+                                    radius: 7
+                                    color: moveFolderRow.forbidden ? "#F1F2F4" : "#FFF4E2"
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "▰"
+                                        color: moveFolderRow.forbidden ? "#B8BEC8" : "#E2A345"
+                                        font.pixelSize: 15
+                                    }
+                                }
+                                Text {
+                                    width: parent.width - 78
+                                    text: modelData.name
+                                    color: moveFolderRow.forbidden ? "#B1B8C4" : "#40516B"
+                                    font.pixelSize: 11
+                                    font.weight: moveFolderMouse.containsMouse
+                                                 ? Font.Medium : Font.Normal
+                                    elide: Text.ElideMiddle
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                Text {
+                                    text: moveFolderRow.forbidden ? "不可选" : "›"
+                                    color: moveFolderRow.forbidden ? "#C1C6CF" : "#9AA6B8"
+                                    font.pixelSize: moveFolderRow.forbidden ? 9 : 16
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+
+                            MouseArea {
+                                id: moveFolderMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                enabled: !moveFolderRow.forbidden && !uploadManager.moving
+                                cursorShape: enabled ? Qt.PointingHandCursor : Qt.ForbiddenCursor
+                                onClicked: moveDialog.navigate(modelData.path)
+                            }
+                        }
+                    }
+
+                    BusyIndicator {
+                        anchors.centerIn: parent
+                        width: 28
+                        height: 28
+                        running: uploadManager.loadingFolderChoices && moveDialog.opened
+                        visible: running
+                    }
+
+                    Text {
+                        anchors.centerIn: parent
+                        width: parent.width - 40
+                        visible: !uploadManager.loadingFolderChoices
+                                 && moveFolderView.count === 0
+                                 && moveDialog.errorText.length === 0
+                        text: "此文件夹没有子文件夹\n可直接选择“移动到此处”"
+                        color: "#9AA6B8"
+                        font.pixelSize: 11
+                        horizontalAlignment: Text.AlignHCenter
+                        lineHeight: 1.4
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 34
+                    text: moveDialog.errorText.length > 0
+                          ? moveDialog.errorText
+                          : "单击文件夹进入下一层；目标位置已存在同名项目时不会覆盖。"
+                    color: moveDialog.errorText.length > 0 ? "#D76D68" : "#9AA6B8"
+                    font.pixelSize: 10
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignTop
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 36
+                    spacing: 9
+
+                    Item { Layout.fillWidth: true }
+
+                    Button {
+                        id: cancelMoveButton
+                        Layout.preferredWidth: 76
+                        Layout.preferredHeight: 36
+                        enabled: !uploadManager.moving
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 8
+                            color: cancelMoveButton.hovered ? "#F4F6FA" : "#FFFFFF"
+                            border.color: "#DFE6F1"
+                        }
+                        contentItem: Text {
+                            text: "取消"
+                            color: cancelMoveButton.enabled ? "#596981" : "#A7B2C2"
+                            font.pixelSize: 11
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onClicked: moveDialog.close()
+                    }
+
+                    Button {
+                        id: confirmMoveButton
+                        Layout.preferredWidth: 112
+                        Layout.preferredHeight: 36
+                        enabled: !uploadManager.moving
+                                 && !uploadManager.loadingFolderChoices
+                                 && moveDialog.directoryLoaded
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 8
+                            color: !confirmMoveButton.enabled ? "#AAB8E8"
+                                   : confirmMoveButton.down ? root.primaryDarkColor
+                                   : confirmMoveButton.hovered ? "#5878F7" : root.primaryColor
+                        }
+                        contentItem: Item {
+                            implicitWidth: moveContentRow.implicitWidth
+                            implicitHeight: moveContentRow.implicitHeight
+                            Row {
+                                id: moveContentRow
+                                anchors.centerIn: parent
+                                spacing: 6
+                                BusyIndicator {
+                                    width: 16
+                                    height: 16
+                                    running: uploadManager.moving
+                                    visible: running
+                                }
+                                Text {
+                                    text: uploadManager.moving ? "移动中…" : "移动到此处"
+                                    color: "#FFFFFF"
+                                    font.pixelSize: 11
+                                    font.weight: Font.DemiBold
+                                    height: 16
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                            }
+                        }
+                        onClicked: moveDialog.submit()
+                    }
+                }
+            }
+        }
+    }
+
     // 下载结果提示：成功时展示最终保存路径，失败时展示具体原因。
     DownloadResultDialog {
         id: downloadResultDialog
@@ -2716,12 +3381,15 @@ Item {
             fileModel.clear()
             root.pendingCreatedFolderName = ""
             root.pendingCreatedFolderPath = ""
+            root.pendingRenamedPath = ""
             root.refreshAfterCurrentFileLoad = false
             root.currentFilter = "全部"
             root.searchKeyword = ""
             searchField.text = ""
             root.clearSelection()
             rowMenu.close()
+            renameDialog.close()
+            moveDialog.close()
         }
 
         // 服务器文件列表加载成功
@@ -2757,6 +3425,21 @@ Item {
                 }
             }
 
+            // 重命名后以服务端返回的新路径重新选中对应项目。
+            if (root.pendingRenamedPath.length > 0) {
+                for (var k = 0; k < fileModel.count; ++k) {
+                    var renamedItem = fileModel.get(k)
+                    var renamedItemPath = renamedItem.path === undefined || renamedItem.path === null
+                                          ? "" : renamedItem.path.toString()
+                    if (renamedItemPath === root.pendingRenamedPath) {
+                        root.selectFile(renamedItem.name, renamedItem.kind, renamedItem.modified,
+                                        renamedItem.size, renamedItem.status, renamedItem.ext)
+                        break
+                    }
+                }
+                root.pendingRenamedPath = ""
+            }
+
             // 若创建前已有列表请求，新请求已取代旧请求；未找到新文件夹时再补查一次。
             if (shouldReloadAfterCurrentLoad) {
                 root.refreshAfterCurrentFileLoad = false
@@ -2780,6 +3463,54 @@ Item {
             createFolderDialog.errorText = reason
             folderNameField.forceActiveFocus()
             folderNameField.selectAll()
+        }
+
+        function onItemRenamed(oldPath, newPath, newName) {
+            root.pendingRenamedPath = newPath
+            root.clearSelection()
+            renameDialog.errorText = ""
+            renameDialog.close()
+
+            // 主动刷新可取消改名前尚未完成的旧列表请求；WebSocket 事件仍用于同步其他客户端。
+            uploadManager.loadFiles()
+        }
+
+        function onItemRenameFailed(oldPath, reason) {
+            renameDialog.errorText = reason
+            renameNameField.forceActiveFocus()
+            renameNameField.selectAll()
+        }
+
+        function onFolderChoicesLoaded(folderPath, folders) {
+            if (!moveDialog.opened || folderPath !== moveDialog.currentFolderPath)
+                return
+            moveDialog.folderItems = folders
+            moveDialog.errorText = ""
+            moveDialog.directoryLoaded = true
+        }
+
+        function onFolderChoicesLoadFailed(folderPath, reason) {
+            if (!moveDialog.opened || folderPath !== moveDialog.currentFolderPath)
+                return
+            moveDialog.folderItems = []
+            moveDialog.directoryLoaded = false
+            moveDialog.errorText = reason
+        }
+
+        function onItemMoved(oldPath, newPath, destinationPath) {
+            moveDialog.errorText = ""
+            moveDialog.close()
+            root.clearSelection()
+
+            // 移动后原目录和目标目录都可能变化；当前若仍在原目录，立即移除旧项目。
+            // WebSocket 事件会继续同步其他客户端，主动刷新则保证离线时也能更新。
+            uploadManager.loadFiles()
+        }
+
+        function onItemMoveFailed(oldPath, reason) {
+            if (!moveDialog.opened)
+                return
+            moveDialog.errorText = reason
         }
 
         // 所有上传任务完成。在线时等待服务器事件，避免每个文件都重复刷新。

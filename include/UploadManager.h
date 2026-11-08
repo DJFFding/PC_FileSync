@@ -22,6 +22,9 @@ class QUrl;
  *
  * 上传协议：POST multipart/form-data，文件字段名为 file。
  * 新建文件夹协议：POST /folders，JSON 请求体为 { "name": "文件夹名称", "path": "父目录" }。
+ * 重命名协议：POST /rename，JSON 请求体为 { "path": "原云端路径", "newName": "新名称" }。
+ * 移动协议：POST /move，JSON 请求体为 { "path": "原云端路径", "destinationPath": "目标文件夹" }。
+ * 目录选择协议：GET /folders?path=目录，只返回该目录的直接子文件夹，供移动弹窗逐级浏览。
  * 文件列表协议：GET /files?path=目录，返回当前层 items，以及递归文件统计。
  * 仍兼容仅返回 items 数组，或 files + directories 数组的服务。
  * 实时同步协议：WebSocket /events，接收服务器 filesChanged 事件并自动刷新。
@@ -38,6 +41,9 @@ class UploadManager final : public QObject
     Q_PROPERTY(bool uploading READ uploading NOTIFY uploadingChanged)
     Q_PROPERTY(bool loadingFiles READ loadingFiles NOTIFY loadingFilesChanged)
     Q_PROPERTY(bool creatingFolder READ creatingFolder NOTIFY creatingFolderChanged)
+    Q_PROPERTY(bool renaming READ renaming NOTIFY renamingChanged)
+    Q_PROPERTY(bool moving READ moving NOTIFY movingChanged)
+    Q_PROPERTY(bool loadingFolderChoices READ loadingFolderChoices NOTIFY loadingFolderChoicesChanged)
     Q_PROPERTY(bool openingFile READ openingFile NOTIFY openingFileChanged)
     Q_PROPERTY(bool downloading READ downloading NOTIFY downloadingChanged)
     Q_PROPERTY(int progress READ progress NOTIFY progressChanged)
@@ -72,6 +78,9 @@ public:
     bool uploading() const;
     bool loadingFiles() const;
     bool creatingFolder() const;
+    bool renaming() const;
+    bool moving() const;
+    bool loadingFolderChoices() const;
     bool openingFile() const;
     bool downloading() const;
     int progress() const;
@@ -101,6 +110,15 @@ public:
 
     // 在当前文件列表接口同级创建 /folders 请求，在当前目录新建一个文件夹。
     Q_INVOKABLE void createFolder(const QString &folderName);
+
+    // 重命名当前服务中的文件或文件夹；newName 只能是单级名称，不能包含路径。
+    Q_INVOKABLE void renameItem(const QString &path, const QString &newName);
+
+    // 将文件或文件夹移动到任意云端目录；destinationPath 为空表示移动到根目录。
+    Q_INVOKABLE void moveItem(const QString &path, const QString &destinationPath);
+
+    // 移动弹窗使用：加载指定云端目录的直接子文件夹，不改变主界面的 currentPath。
+    Q_INVOKABLE void loadFolderChoices(const QString &folderPath);
 
     // 打开文件：远端文件先流式下载到临时目录，再交给系统默认程序打开。
     // 临时文件由本类持有，应用退出前不会被清理，避免外部程序读到不存在的路径。
@@ -142,6 +160,9 @@ signals:
     void uploadingChanged();
     void loadingFilesChanged();
     void creatingFolderChanged();
+    void renamingChanged();
+    void movingChanged();
+    void loadingFolderChoicesChanged();
     void openingFileChanged();
     void downloadingChanged();
     void progressChanged();
@@ -169,6 +190,18 @@ signals:
                        const QString &folderPath,
                        const QString &modifiedText);
     void folderCreationFailed(const QString &folderName, const QString &reason);
+
+    void itemRenamed(const QString &oldPath,
+                     const QString &newPath,
+                     const QString &newName);
+    void itemRenameFailed(const QString &oldPath, const QString &reason);
+
+    void itemMoved(const QString &oldPath,
+                   const QString &newPath,
+                   const QString &destinationPath);
+    void itemMoveFailed(const QString &oldPath, const QString &reason);
+    void folderChoicesLoaded(const QString &folderPath, const QVariantList &folders);
+    void folderChoicesLoadFailed(const QString &folderPath, const QString &reason);
 
     void fileOpened(const QString &path, const QString &localPath);
     void fileOpenFailed(const QString &path, const QString &reason);
@@ -236,6 +269,9 @@ private:
     void setUploading(bool value);
     void setLoadingFiles(bool value);
     void setCreatingFolder(bool value);
+    void setRenaming(bool value);
+    void setMoving(bool value);
+    void setLoadingFolderChoices(bool value);
     void setOpeningFile(bool value);
     void setDownloading(bool value);
     void setProgress(int value);
@@ -262,6 +298,9 @@ private:
     QNetworkReply *m_reply = nullptr;
     QNetworkReply *m_listReply = nullptr;
     QNetworkReply *m_folderReply = nullptr;
+    QNetworkReply *m_renameReply = nullptr;
+    QNetworkReply *m_moveReply = nullptr;
+    QNetworkReply *m_folderChoicesReply = nullptr;
     QNetworkReply *m_documentReply = nullptr;
     QNetworkReply *m_openReply = nullptr;
     QNetworkReply *m_downloadReply = nullptr;
@@ -313,6 +352,9 @@ private:
     bool m_uploading = false;
     bool m_loadingFiles = false;
     bool m_creatingFolder = false;
+    bool m_renaming = false;
+    bool m_moving = false;
+    bool m_loadingFolderChoices = false;
     bool m_openingFile = false;
     bool m_downloading = false;
     int m_progress = 0;
