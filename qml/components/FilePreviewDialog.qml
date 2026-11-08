@@ -5,7 +5,7 @@ import QtQuick.Window
 
 /*
  * 覆盖 Main.qml 整个窗口的全屏文件预览。
- * supported: 图片、分块文本、PDF、DOCX（段落/表格文字提取）。
+ * supported: 图片、分块文本、PDF、DOCX（转换为 PDF 后保留版面预览）。
  * 不支持的二进制类型由 openPreview() 直接忽略。
  */
 Dialog {
@@ -27,6 +27,8 @@ Dialog {
     property string filePath: ""
     property string sourceUrl: ""
     property string previewKind: ""
+    readonly property bool pagedDocument: previewKind === "pdf"
+                                          || previewKind === "docx"
 
     property string imageSource: ""
     property real imageScale: 1.0
@@ -36,7 +38,6 @@ Dialog {
     property int pdfPageCount: 0
     property int pdfCurrentPage: 0
     property int pdfRenderWidth: 1280
-    property string docxHtml: ""
     property string documentError: ""
     property bool documentLoading: false
     property int documentRequestId: 0
@@ -183,7 +184,6 @@ Dialog {
         pdfPageCount = 0
         pdfCurrentPage = 0
         pdfRenderWidth = 1280
-        docxHtml = ""
         documentError = ""
         documentLoading = false
         documentRequestId = 0
@@ -252,19 +252,17 @@ Dialog {
             }
             return textLoadedOnce ? "已加载全部文本" : "准备加载文本"
         }
-        if (previewKind === "pdf") {
+        if (pagedDocument) {
             if (documentError.length > 0)
                 return documentError
-            if (pdfPageCount > 0)
-                return "第 " + (pdfCurrentPage + 1) + " 页，共 "
+            if (pdfPageCount > 0) {
+                var converted = previewKind === "docx" ? "DOCX 已转换为 PDF，" : ""
+                return converted + "第 " + (pdfCurrentPage + 1) + " 页，共 "
                        + pdfPageCount + " 页，MuPDF 按需渲染"
-            return "正在下载并解析 PDF…"
-        }
-        if (previewKind === "docx") {
-            if (documentError.length > 0)
-                return documentError
-            return documentLoading ? "正在下载并解析 DOCX…"
-                                   : "DOCX 文本预览（不还原复杂排版和嵌入图片）"
+            }
+            return previewKind === "docx"
+                   ? "正在下载 DOCX 并转换为 PDF（还原排版和嵌入图片）…"
+                   : "正在下载并解析 PDF…"
         }
         return ""
     }
@@ -276,7 +274,7 @@ Dialog {
     }
 
     function activeEditor() {
-        return previewKind === "docx" ? docxEditor : textEditor
+        return textEditor
     }
 
     function copySelectedText() {
@@ -291,7 +289,7 @@ Dialog {
     }
 
     function copyTextPreview() {
-        if (previewKind !== "text" && previewKind !== "docx")
+        if (previewKind !== "text")
             return
 
         if (activeEditor().selectedText.length > 0) {
@@ -303,29 +301,7 @@ Dialog {
         }
     }
 
-    function copyDocxAllText() {
-        var selectionStart = docxEditor.selectionStart
-        var selectionEnd = docxEditor.selectionEnd
-        var hadSelection = docxEditor.selectedText.length > 0
-
-        docxEditor.forceActiveFocus()
-        docxEditor.selectAll()
-        var allText = docxEditor.selectedText
-        manager.copyTextToClipboard(allText)
-
-        if (hadSelection)
-            docxEditor.select(selectionStart, selectionEnd)
-        else
-            docxEditor.deselect()
-        showCopyMessage("已复制 DOCX 全部提取文本", true)
-    }
-
     function copyAllText() {
-        if (previewKind === "docx") {
-            if (docxHtml.length > 0)
-                copyDocxAllText()
-            return
-        }
         if (previewKind !== "text" || copyAllLoading)
             return
 
@@ -476,7 +452,7 @@ Dialog {
     }
 
     function fitPdfWidth() {
-        if (previewKind !== "pdf" || pdfView.width <= 0)
+        if (!pagedDocument || pdfView.width <= 0)
             return
 
         // 按设备像素比渲染，保证高分屏文字清晰；按 256 像素分桶，避免缩放窗口时频繁重渲染。
@@ -496,7 +472,7 @@ Dialog {
     }
 
     function updatePdfCurrentPage() {
-        if (previewKind !== "pdf" || pdfPageCount <= 0 || pdfView.count <= 0) {
+        if (!pagedDocument || pdfPageCount <= 0 || pdfView.count <= 0) {
             pdfCurrentPage = 0
             return
         }
@@ -517,7 +493,6 @@ Dialog {
         pdfPageCount = 0
         pdfCurrentPage = 0
         pdfRenderWidth = 1280
-        docxHtml = ""
         previewKind = ""
     }
 
@@ -525,7 +500,7 @@ Dialog {
         target: dialog.manager
 
         function onPdfPreviewReady(requestId, localUrl, pageCount) {
-            if (dialog.previewKind !== "pdf" || requestId !== dialog.documentRequestId)
+            if (!dialog.pagedDocument || requestId !== dialog.documentRequestId)
                 return
             dialog.documentError = ""
             dialog.pdfSource = localUrl
@@ -536,17 +511,8 @@ Dialog {
             Qt.callLater(dialog.updatePdfCurrentPage)
         }
 
-        function onDocxPreviewReady(requestId, html) {
-            if (dialog.previewKind !== "docx" || requestId !== dialog.documentRequestId)
-                return
-            dialog.documentLoading = false
-            dialog.documentError = ""
-            dialog.docxHtml = html
-        }
-
         function onDocumentPreviewFailed(requestId, reason) {
-            if ((dialog.previewKind !== "pdf" && dialog.previewKind !== "docx")
-                    || requestId !== dialog.documentRequestId)
+            if (!dialog.pagedDocument || requestId !== dialog.documentRequestId)
                 return
             dialog.documentLoading = false
             dialog.documentError = reason
@@ -617,16 +583,14 @@ Dialog {
                     }
                 }
                 DarkToolbarButton {
-                    visible: dialog.previewKind === "text" || dialog.previewKind === "docx"
+                    visible: dialog.previewKind === "text"
                     width: 76
                     focusPolicy: Qt.NoFocus
                     text: dialog.copyAllLoading ? "复制中…"
                                                 : (dialog.copySucceeded ? "已复制" : "复制")
                     ToolTip.visible: hovered
                     ToolTip.text: "复制选中文本；未选择时复制全部"
-                    enabled: !dialog.copyAllLoading
-                             && (dialog.previewKind === "docx" ? dialog.docxHtml.length > 0
-                                                               : dialog.sourceUrl.length > 0)
+                    enabled: !dialog.copyAllLoading && dialog.sourceUrl.length > 0
                     onClicked: dialog.copyTextPreview()
                 }
                 DarkToolbarButton {
@@ -781,7 +745,7 @@ Dialog {
             ListView {
                 id: pdfView
                 anchors.fill: parent
-                visible: dialog.previewKind === "pdf" && dialog.pdfSource.length > 0
+                visible: dialog.pagedDocument && dialog.pdfSource.length > 0
                          && dialog.pdfPageCount > 0 && dialog.documentError.length === 0
                 clip: true
                 model: dialog.pdfPageCount
@@ -846,80 +810,16 @@ Dialog {
                 }
             }
 
-            Flickable {
-                id: docxFlick
-                anchors.fill: parent
-                anchors.margins: 0
-                visible: dialog.previewKind === "docx" && dialog.docxHtml.length > 0
-                clip: true
-                contentWidth: width
-                contentHeight: docxEditor.contentHeight + 48
-                flickableDirection: Flickable.VerticalFlick
-                boundsBehavior: Flickable.StopAtBounds
-
-                Rectangle {
-                    x: 0
-                    y: 0
-                    width: docxFlick.width
-                    height: Math.max(docxFlick.height, docxEditor.contentHeight + 48)
-                    color: dialog.panelColor
-                }
-
-                TextEdit {
-                    id: docxEditor
-                    x: 24
-                    y: 24
-                    width: Math.max(1, docxFlick.width - 48)
-                    height: contentHeight
-                    text: dialog.docxHtml
-                    textFormat: TextEdit.RichText
-                    readOnly: true
-                    selectByMouse: true
-                    selectByKeyboard: true
-                    persistentSelection: true
-                    cursorVisible: false
-                    color: dialog.textDarkColor
-                    selectionColor: dialog.primaryColor
-                    selectedTextColor: dialog.panelColor
-                    font.pixelSize: 16
-                    wrapMode: TextEdit.WrapAtWordBoundaryOrAnywhere
-                    // 阻止 TextEdit 提前执行默认的 Ctrl+C，
-                    // 让下面的 Keys.onPressed 统一处理。
-                    Keys.onShortcutOverride: function(event) {
-                        if (event.key === Qt.Key_C
-                                && (event.modifiers & Qt.ControlModifier)) {
-                            event.accepted = true
-                        }
-                    }
-
-                    Keys.onPressed: function(event) {
-                        if (event.key === Qt.Key_C
-                                && (event.modifiers & Qt.ControlModifier)) {
-                            if (!event.isAutoRepeat)
-                                dialog.copyTextPreview()
-
-                            // 阻止事件继续传递，避免重复复制。
-                            event.accepted = true
-                        }
-                    }
-                }
-
-                ScrollBar.vertical: ScrollBar {
-                    policy: ScrollBar.AsNeeded
-                }
-            }
-
             BusyIndicator {
                 anchors.centerIn: parent
-                visible: (dialog.previewKind === "pdf" || dialog.previewKind === "docx")
-                         && dialog.documentLoading && dialog.documentError.length === 0
+                visible: dialog.pagedDocument && dialog.documentLoading
+                         && dialog.documentError.length === 0
                 running: visible
             }
             Text {
                 anchors.centerIn: parent
                 width: Math.min(560, parent.width - 48)
-                visible: (dialog.previewKind === "pdf" || dialog.previewKind === "docx")
-                         && dialog.documentError.length > 0
+                visible: dialog.pagedDocument && dialog.documentError.length > 0
                 text: dialog.documentError
                 color: "#C77B76"
                 font.pixelSize: 14

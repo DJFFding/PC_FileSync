@@ -18,8 +18,14 @@
 #include <QUrl>
 #include <QUrlQuery>
 #include <QUuid>
+#include <QWebSocket>
+#include <QWebSocketProtocol>
 
 #include <QDebug>
+
+#include <algorithm>
+#include <functional>
+#include <utility>
 
 namespace {
 
@@ -27,6 +33,61 @@ QString uploadedFilesPath()
 {
     return QDir(QCoreApplication::applicationDirPath())
         .filePath(QStringLiteral("uploaded_files"));
+}
+
+// 将客户端传入的云端相对路径限制在上传根目录内。空字符串和 "." 均表示根目录。
+bool cleanCloudPath(const QString &requestedPath, QString *cleanPath, QString *error)
+{
+    const QString relativePath = QDir::fromNativeSeparators(requestedPath);
+    const QString cleaned = QDir::cleanPath(relativePath);
+    if (relativePath.contains(QLatin1Char('\0'))
+        || QDir::isAbsolutePath(relativePath)
+        || cleaned == QStringLiteral("..")
+        || cleaned.startsWith(QStringLiteral("../"))
+        || cleaned.startsWith(QLatin1Char('/'))) {
+        *error = QStringLiteral("目录路径不安全");
+        return false;
+    }
+
+    *cleanPath = cleaned == QStringLiteral(".") ? QString() : cleaned;
+    return true;
+}
+
+bool resolveCloudDirectory(const QDir &rootDir,
+                           const QString &requestedPath,
+                           QDir *directory,
+                           QString *relativePath,
+                           QString *error)
+{
+    QString cleaned;
+    if (!cleanCloudPath(requestedPath, &cleaned, error))
+        return false;
+
+    const QString canonicalRoot = QDir::fromNativeSeparators(rootDir.canonicalPath());
+    if (canonicalRoot.isEmpty()) {
+        *error = QStringLiteral("文件存储目录不可用");
+        return false;
+    }
+
+    if (cleaned.isEmpty()) {
+        *directory = QDir(canonicalRoot);
+        relativePath->clear();
+        return true;
+    }
+
+    const QFileInfo targetInfo(rootDir.filePath(cleaned));
+    const QString canonicalTarget = QDir::fromNativeSeparators(targetInfo.canonicalFilePath());
+    const QString rootPrefix = canonicalRoot.endsWith(QLatin1Char('/'))
+        ? canonicalRoot : canonicalRoot + QLatin1Char('/');
+    if (!targetInfo.exists() || !targetInfo.isDir() || targetInfo.isSymLink()
+        || canonicalTarget.isEmpty() || !canonicalTarget.startsWith(rootPrefix)) {
+        *error = QStringLiteral("目录不存在或不可访问");
+        return false;
+    }
+
+    *directory = QDir(canonicalTarget);
+    *relativePath = cleaned;
+    return true;
 }
 
 bool validateFolderName(const QString &folderName, QString *error)
@@ -303,6 +364,8 @@ int appendDirectoryItems(const QDir &directory,
 LocalUploadServer::LocalUploadServer(QObject *parent)
     : QObject(parent)
     , m_server()
+    , m_eventServer(QStringLiteral("FileSync Events"),
+                    QWebSocketServer::NonSecureMode)
 {
     connect(&m_server, &QTcpServer::newConnection, this, [this]() {
         while (m_server.hasPendingConnections()) {
@@ -317,23 +380,238 @@ LocalUploadServer::LocalUploadServer(QObject *parent)
             });
         }
     });
+
+    connect(&m_eventServer, &QWebSocketServer::newConnection,
+            this, &LocalUploadServer::handleEventConnection);
+
+    // 目录信号覆盖新增、删除和重命名；文件信号覆盖内容及元数据修改。
+    connect(&m_fileWatcher, &QFileSystemWatcher::directoryChanged,
+            this, [this](const QString &path) {
+        queueFileChange(cloudPathForFileName(path));
+    });
+    connect(&m_fileWatcher, &QFileSystemWatcher::fileChanged,
+            this, [this](const QString &path) {
+        queueFileChange(cloudPathForFileName(path));
+    });
+
+    // 高频变更合并为一个事件，避免客户端因一次保存操作反复刷新。
+    m_changeTimer.setSingleShot(true);
+    m_changeTimer.setInterval(250);
+    connect(&m_changeTimer, &QTimer::timeout,
+            this, &LocalUploadServer::broadcastFileChanges);
 }
 
-bool LocalUploadServer::listen(quint16 port)
+bool LocalUploadServer::listen(quint16 port, quint16 eventPort)
 {
-    const bool ok = m_server.listen(QHostAddress::LocalHost, port);
-    if (ok) {
-        qInfo().noquote() << QStringLiteral("FileSync 本地测试服务已启动：")
-                          << QStringLiteral("http://127.0.0.1:%1/upload").arg(m_server.serverPort());
-        qInfo().noquote() << QStringLiteral("文件列表接口：")
-                          << QStringLiteral("http://127.0.0.1:%1/files").arg(m_server.serverPort());
-        qInfo().noquote() << QStringLiteral("新建文件夹接口：")
-                          << QStringLiteral("http://127.0.0.1:%1/folders").arg(m_server.serverPort());
-        qInfo().noquote() << QStringLiteral("上传目录：%1").arg(uploadedFilesPath());
-    } else {
-        qCritical().noquote() << QStringLiteral("监听失败：%1").arg(m_server.errorString());
+    if (m_server.isListening() || m_eventServer.isListening()) {
+        qWarning().noquote() << QStringLiteral("FileSync 服务已经在监听");
+        return false;
     }
-    return ok;
+
+    const quint32 resolvedEventPort = eventPort == 0
+        ? static_cast<quint32>(port) + 1 : static_cast<quint32>(eventPort);
+    if (resolvedEventPort > 65535) {
+        qCritical().noquote() << QStringLiteral("WebSocket 端口无效");
+        return false;
+    }
+
+    QDir rootDir(uploadedFilesPath());
+    if (!rootDir.exists()) {
+        QDir appDir(QCoreApplication::applicationDirPath());
+        if (!appDir.mkpath(QStringLiteral("uploaded_files"))) {
+            qCritical().noquote() << QStringLiteral("无法创建文件存储目录");
+            return false;
+        }
+        rootDir = QDir(uploadedFilesPath());
+    }
+
+    if (!m_server.listen(QHostAddress::LocalHost, port)) {
+        qCritical().noquote() << QStringLiteral("HTTP 监听失败：%1")
+                                     .arg(m_server.errorString());
+        return false;
+    }
+
+    if (!m_eventServer.listen(QHostAddress::LocalHost,
+                              static_cast<quint16>(resolvedEventPort))) {
+        qCritical().noquote() << QStringLiteral("WebSocket 监听失败：%1")
+                                     .arg(m_eventServer.errorString());
+        m_server.close();
+        return false;
+    }
+
+    m_storageRoot = QDir::cleanPath(rootDir.absolutePath());
+    m_knownPaths.clear();
+    m_pendingChanges.clear();
+    m_watchInitialized = false;
+    rebuildFileSystemWatch();
+
+    qInfo().noquote() << QStringLiteral("FileSync 本地测试服务已启动：")
+                      << QStringLiteral("http://127.0.0.1:%1/upload")
+                             .arg(m_server.serverPort());
+    qInfo().noquote() << QStringLiteral("文件列表接口：")
+                      << QStringLiteral("http://127.0.0.1:%1/files")
+                             .arg(m_server.serverPort());
+    qInfo().noquote() << QStringLiteral("实时变更事件：")
+                      << QStringLiteral("ws://127.0.0.1:%1/events")
+                             .arg(m_eventServer.serverPort());
+    qInfo().noquote() << QStringLiteral("上传目录：%1").arg(m_storageRoot);
+    return true;
+}
+
+void LocalUploadServer::handleEventConnection()
+{
+    while (m_eventServer.hasPendingConnections()) {
+        QWebSocket *socket = m_eventServer.nextPendingConnection();
+        if (!socket)
+            continue;
+
+        if (socket->requestUrl().path() != QStringLiteral("/events")) {
+            socket->close(QWebSocketProtocol::CloseCodePolicyViolated,
+                          QStringLiteral("请连接 /events"));
+            socket->deleteLater();
+            continue;
+        }
+
+        socket->setParent(this);
+        m_eventClients.append(socket);
+        connect(socket, &QWebSocket::disconnected, this, [this, socket]() {
+            m_eventClients.removeAll(socket);
+            socket->deleteLater();
+        });
+
+        const QJsonObject readyEvent{
+            {QStringLiteral("type"), QStringLiteral("ready")},
+            {QStringLiteral("revision"), static_cast<double>(m_revision)},
+            {QStringLiteral("timestamp"),
+             QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}
+        };
+        socket->sendTextMessage(QString::fromUtf8(
+            QJsonDocument(readyEvent).toJson(QJsonDocument::Compact)));
+    }
+}
+
+QString LocalUploadServer::cloudPathForFileName(const QString &absolutePath) const
+{
+    if (m_storageRoot.isEmpty())
+        return {};
+
+    const QString relative = QDir(m_storageRoot).relativeFilePath(
+        QDir::cleanPath(absolutePath));
+    const QString normalized = QDir::fromNativeSeparators(relative);
+    if (normalized == QStringLiteral("."))
+        return {};
+    if (normalized == QStringLiteral("..")
+        || normalized.startsWith(QStringLiteral("../"))
+        || QDir::isAbsolutePath(normalized)) {
+        return {};
+    }
+    return normalized;
+}
+
+void LocalUploadServer::rebuildFileSystemWatch()
+{
+    QDir rootDir(m_storageRoot);
+    if (m_storageRoot.isEmpty() || !rootDir.exists())
+        return;
+
+    QSet<QString> currentPaths;
+    QSet<QString> currentAbsolutePaths;
+    currentPaths.insert(QString()); // 根目录
+    currentAbsolutePaths.insert(QDir::cleanPath(rootDir.absolutePath()));
+
+    std::function<void(const QDir &)> collect = [&](const QDir &directory) {
+        const QFileInfoList entries = directory.entryInfoList(
+            QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot,
+            QDir::DirsFirst | QDir::Name | QDir::IgnoreCase);
+        for (const QFileInfo &info : entries) {
+            if (info.isSymLink())
+                continue;
+
+            const QString absolutePath = QDir::cleanPath(info.absoluteFilePath());
+            const QString cloudPath = cloudPathForFileName(absolutePath);
+            currentPaths.insert(cloudPath);
+            currentAbsolutePaths.insert(absolutePath);
+            if (info.isDir())
+                collect(QDir(absolutePath));
+        }
+    };
+    collect(rootDir);
+
+    if (m_watchInitialized) {
+        for (const QString &path : currentPaths) {
+            if (!m_knownPaths.contains(path) && !path.isEmpty())
+                m_pendingChanges.insert(path);
+        }
+        for (const QString &path : m_knownPaths) {
+            if (!currentPaths.contains(path))
+                m_pendingChanges.insert(path);
+        }
+    }
+
+    QStringList watchedPaths = m_fileWatcher.directories();
+    watchedPaths.append(m_fileWatcher.files());
+    QSet<QString> watchedSet(watchedPaths.begin(), watchedPaths.end());
+    for (const QString &path : watchedPaths) {
+        const QString cleaned = QDir::cleanPath(path);
+        if (!currentAbsolutePaths.contains(cleaned)) {
+            m_fileWatcher.removePath(path);
+            watchedSet.remove(cleaned);
+        }
+    }
+    for (const QString &path : currentAbsolutePaths) {
+        if (!watchedSet.contains(path) && !m_fileWatcher.addPath(path))
+            qWarning().noquote() << QStringLiteral("无法监听文件路径：%1").arg(path);
+    }
+
+    m_knownPaths = currentPaths;
+    m_watchInitialized = true;
+}
+
+void LocalUploadServer::queueFileChange(const QString &cloudPath)
+{
+    if (!m_eventServer.isListening())
+        return;
+
+    m_pendingChanges.insert(QDir::fromNativeSeparators(cloudPath));
+    if (!m_changeTimer.isActive())
+        m_changeTimer.start();
+}
+
+void LocalUploadServer::broadcastFileChanges()
+{
+    // 重新扫描可同时发现新增/删除项，并补建新增目录及改名文件的监听。
+    rebuildFileSystemWatch();
+    if (m_pendingChanges.isEmpty())
+        return;
+
+    QStringList paths = m_pendingChanges.values();
+    m_pendingChanges.clear();
+    std::sort(paths.begin(), paths.end());
+
+    // 大量变更时退化为全量刷新通知，避免构造过大的 WebSocket 消息。
+    if (paths.size() > 200) {
+        paths.clear();
+        paths.append(QString());
+    }
+
+    QJsonArray pathArray;
+    for (const QString &path : paths)
+        pathArray.append(path);
+
+    const QJsonObject event{
+        {QStringLiteral("type"), QStringLiteral("filesChanged")},
+        {QStringLiteral("revision"), static_cast<double>(++m_revision)},
+        {QStringLiteral("paths"), pathArray},
+        {QStringLiteral("timestamp"),
+         QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}
+    };
+    const QString message = QString::fromUtf8(
+        QJsonDocument(event).toJson(QJsonDocument::Compact));
+
+    for (QWebSocket *socket : std::as_const(m_eventClients)) {
+        if (socket && socket->state() == QAbstractSocket::ConnectedState)
+            socket->sendTextMessage(message);
+    }
 }
 
 void LocalUploadServer::readRequest(QTcpSocket *socket)
@@ -370,7 +648,7 @@ void LocalUploadServer::readRequest(QTcpSocket *socket)
 
     // GET 请求没有请求体，不能要求它必须携带 Content-Length。
     if (method == QByteArrayLiteral("GET") && requestPath == QStringLiteral("/files")) {
-        processFilesRequest(socket);
+        processFilesRequest(socket, requestUrl);
         return;
     }
 
@@ -435,10 +713,10 @@ void LocalUploadServer::readRequest(QTcpSocket *socket)
         processCreateFolderRequest(socket, body);
         return;
     }
-    processRequest(socket, headerBlock, body);
+    processRequest(socket, requestUrl, headerBlock, body);
 }
 
-void LocalUploadServer::processFilesRequest(QTcpSocket *socket)
+void LocalUploadServer::processFilesRequest(QTcpSocket *socket, const QUrl &requestUrl)
 {
     QDir rootDir(uploadedFilesPath());
     if (!rootDir.exists()) {
@@ -454,17 +732,70 @@ void LocalUploadServer::processFilesRequest(QTcpSocket *socket)
         rootDir = QDir(uploadedFilesPath());
     }
 
+    const QUrlQuery requestQuery(requestUrl);
+    const QString requestedPath = requestQuery.queryItemValue(
+        QStringLiteral("path"), QUrl::FullyDecoded);
+    QDir currentDir;
+    QString currentPath;
+    QString pathError;
+    if (!resolveCloudDirectory(rootDir, requestedPath, &currentDir, &currentPath, &pathError)) {
+        sendJson(socket, 404, QByteArrayLiteral("Not Found"),
+                 QJsonDocument(QJsonObject{
+                     {QStringLiteral("success"), false},
+                     {QStringLiteral("message"), pathError}
+                 }).toJson(QJsonDocument::Compact));
+        return;
+    }
+
+    // 仅扫描当前目录子树；递归统计全部文件，但列表只保留当前目录的直接子项。
+    QJsonArray allItems;
+    const int totalFiles = appendDirectoryItems(currentDir, currentPath, &allItems);
     QJsonArray items;
-    const int totalFiles = appendDirectoryItems(rootDir, QString(), &items);
+    int syncedFiles = 0;
+    int syncingFiles = 0;
+    const QString pathPrefix = currentPath.isEmpty()
+        ? QString() : currentPath + QLatin1Char('/');
+
+    for (const QJsonValue &value : allItems) {
+        const QJsonObject object = value.toObject();
+        const QString itemPath = object.value(QStringLiteral("path")).toString();
+        const QString status = object.value(QStringLiteral("status")).toString();
+        if (object.value(QStringLiteral("kind")).toString() != QStringLiteral("folder")) {
+            if (status == QStringLiteral("同步中") || status == QStringLiteral("正在同步")
+                || status.compare(QStringLiteral("syncing"), Qt::CaseInsensitive) == 0) {
+                ++syncingFiles;
+            } else if (status == QStringLiteral("已同步")
+                       || status.compare(QStringLiteral("synced"), Qt::CaseInsensitive) == 0) {
+                ++syncedFiles;
+            }
+        }
+
+        if (!pathPrefix.isEmpty() && !itemPath.startsWith(pathPrefix))
+            continue;
+        const QString relativeName = pathPrefix.isEmpty()
+            ? itemPath : itemPath.mid(pathPrefix.size());
+        if (!relativeName.isEmpty() && !relativeName.contains(QLatin1Char('/')))
+            items.append(object);
+    }
+
+    QString parentPath;
+    const int lastSlash = currentPath.lastIndexOf(QLatin1Char('/'));
+    if (lastSlash >= 0)
+        parentPath = currentPath.left(lastSlash);
 
     const QJsonObject responseObject{
         {QStringLiteral("success"), true},
+        {QStringLiteral("currentPath"), currentPath},
+        {QStringLiteral("parentPath"), parentPath},
         {QStringLiteral("totalFiles"), totalFiles},
+        {QStringLiteral("syncedFiles"), syncedFiles},
+        {QStringLiteral("syncingFiles"), syncingFiles},
         {QStringLiteral("totalItems"), items.size()},
         {QStringLiteral("items"), items}
     };
 
-    qInfo().noquote() << QStringLiteral("文件列表查询成功：%1 个文件，%2 个条目")
+    qInfo().noquote() << QStringLiteral("目录查询成功：%1，%2 个文件，当前层 %3 个项目")
+                             .arg(currentPath.isEmpty() ? QStringLiteral("/") : currentPath)
                              .arg(totalFiles)
                              .arg(items.size());
 
@@ -658,7 +989,8 @@ void LocalUploadServer::processCreateFolderRequest(QTcpSocket *socket,
         return;
     }
 
-    const QString folderName = document.object().value(QStringLiteral("name"))
+    const QJsonObject requestObject = document.object();
+    const QString folderName = requestObject.value(QStringLiteral("name"))
                                .toString().trimmed();
     QString validationError;
     if (!validateFolderName(folderName, &validationError)) {
@@ -677,16 +1009,26 @@ void LocalUploadServer::processCreateFolderRequest(QTcpSocket *socket,
         rootDir = QDir(uploadedFilesPath());
     }
 
-    const QFileInfo targetInfo(rootDir.filePath(folderName));
+    const QString requestedParentPath = requestObject.value(QStringLiteral("path")).toString();
+    QDir parentDir;
+    QString parentPath;
+    QString pathError;
+    if (!resolveCloudDirectory(rootDir, requestedParentPath,
+                               &parentDir, &parentPath, &pathError)) {
+        sendError(404, QByteArrayLiteral("Not Found"), pathError);
+        return;
+    }
+
+    const QFileInfo targetInfo(parentDir.filePath(folderName));
     if (targetInfo.exists() || targetInfo.isSymLink()) {
         sendError(409, QByteArrayLiteral("Conflict"),
                   QStringLiteral("已存在同名文件或文件夹，请更换名称"));
         return;
     }
 
-    // 只创建一级目录，不使用 mkpath，避免请求被解释为嵌套路径。
-    if (!rootDir.mkdir(folderName)) {
-        const QFileInfo conflictInfo(rootDir.filePath(folderName));
+    // 只创建一级目录，不使用 mkpath，避免文件夹名称被解释为嵌套路径。
+    if (!parentDir.mkdir(folderName)) {
+        const QFileInfo conflictInfo(parentDir.filePath(folderName));
         if (conflictInfo.exists() || conflictInfo.isSymLink()) {
             sendError(409, QByteArrayLiteral("Conflict"),
                       QStringLiteral("已存在同名文件或文件夹，请更换名称"));
@@ -697,7 +1039,7 @@ void LocalUploadServer::processCreateFolderRequest(QTcpSocket *socket,
         return;
     }
 
-    const QFileInfo folderInfo(rootDir.filePath(folderName));
+    const QFileInfo folderInfo(parentDir.filePath(folderName));
     const QString canonicalRoot = QDir::fromNativeSeparators(rootDir.canonicalPath());
     const QString canonicalFolder = QDir::fromNativeSeparators(folderInfo.canonicalFilePath());
     const QString rootPrefix = canonicalRoot.endsWith(QLatin1Char('/'))
@@ -705,15 +1047,17 @@ void LocalUploadServer::processCreateFolderRequest(QTcpSocket *socket,
     if (!folderInfo.isDir() || folderInfo.isSymLink()
         || canonicalRoot.isEmpty() || canonicalFolder.isEmpty()
         || !canonicalFolder.startsWith(rootPrefix)) {
-        rootDir.rmdir(folderName);
+        parentDir.rmdir(folderName);
         sendError(403, QByteArrayLiteral("Forbidden"),
                   QStringLiteral("不允许在上传目录之外创建文件夹"));
         return;
     }
 
+    const QString folderPath = parentPath.isEmpty()
+        ? folderName : parentPath + QLatin1Char('/') + folderName;
     const QJsonObject folderObject{
         {QStringLiteral("name"), folderName},
-        {QStringLiteral("path"), folderName},
+        {QStringLiteral("path"), folderPath},
         {QStringLiteral("kind"), QStringLiteral("folder")},
         {QStringLiteral("ext"), QStringLiteral("文件夹")},
         {QStringLiteral("modified"), folderInfo.lastModified().toString(
@@ -728,21 +1072,25 @@ void LocalUploadServer::processCreateFolderRequest(QTcpSocket *socket,
         {QStringLiteral("success"), true},
         {QStringLiteral("message"), QStringLiteral("文件夹创建成功")},
         {QStringLiteral("name"), folderName},
-        {QStringLiteral("path"), folderName},
+        {QStringLiteral("path"), folderPath},
         {QStringLiteral("folder"), folderObject}
     };
 
     qInfo().noquote() << QStringLiteral("新建文件夹成功：%1").arg(canonicalFolder);
+    queueFileChange(folderPath);
     sendJson(socket, 201, QByteArrayLiteral("Created"),
              QJsonDocument(responseObject).toJson(QJsonDocument::Compact));
 }
 
 void LocalUploadServer::processRequest(QTcpSocket *socket,
+                                       const QUrl &requestUrl,
                                        const QByteArray &headerBlock,
                                        const QByteArray &body)
 {
     const QList<QByteArray> lines = headerBlock.split('\n');
-    if (lines.isEmpty() || !lines.first().trimmed().startsWith(QByteArrayLiteral("POST /upload "))) {
+    const QByteArray requestLine = lines.isEmpty() ? QByteArray() : lines.first().trimmed();
+    if (!requestLine.startsWith(QByteArrayLiteral("POST /upload "))
+        && !requestLine.startsWith(QByteArrayLiteral("POST /upload?"))) {
         sendJson(socket, 404, QByteArrayLiteral("Not Found"),
                  QJsonDocument(QJsonObject{
                      {QStringLiteral("success"), false},
@@ -830,16 +1178,34 @@ void LocalUploadServer::processRequest(QTcpSocket *socket,
     }
 
     const QByteArray fileData = body.mid(dataStart, dataEnd - dataStart);
-    QDir outputDir(QCoreApplication::applicationDirPath());
-    if (!outputDir.mkpath(QStringLiteral("uploaded_files"))) {
-        sendJson(socket, 500, QByteArrayLiteral("Internal Server Error"),
+    QDir rootDir(uploadedFilesPath());
+    if (!rootDir.exists()) {
+        QDir appDir(QCoreApplication::applicationDirPath());
+        if (!appDir.mkpath(QStringLiteral("uploaded_files"))) {
+            sendJson(socket, 500, QByteArrayLiteral("Internal Server Error"),
+                     QJsonDocument(QJsonObject{
+                         {QStringLiteral("success"), false},
+                         {QStringLiteral("message"), QStringLiteral("无法创建上传目录")}
+                     }).toJson(QJsonDocument::Compact));
+            return;
+        }
+        rootDir = QDir(uploadedFilesPath());
+    }
+
+    const QString requestedDirectory = QUrlQuery(requestUrl).queryItemValue(
+        QStringLiteral("path"), QUrl::FullyDecoded);
+    QDir outputDir;
+    QString directoryPath;
+    QString pathError;
+    if (!resolveCloudDirectory(rootDir, requestedDirectory,
+                               &outputDir, &directoryPath, &pathError)) {
+        sendJson(socket, 404, QByteArrayLiteral("Not Found"),
                  QJsonDocument(QJsonObject{
                      {QStringLiteral("success"), false},
-                     {QStringLiteral("message"), QStringLiteral("无法创建上传目录")}
+                     {QStringLiteral("message"), pathError}
                  }).toJson(QJsonDocument::Compact));
         return;
     }
-    outputDir.cd(QStringLiteral("uploaded_files"));
 
     const QString originalName = fileName;
     const QFileInfo nameInfo(fileName);
@@ -879,12 +1245,17 @@ void LocalUploadServer::processRequest(QTcpSocket *socket,
                              .arg(originalName)
                              .arg(fileData.size());
 
+    const QString savedPath = directoryPath.isEmpty()
+        ? saveName : directoryPath + QLatin1Char('/') + saveName;
     const QJsonObject responseObject{
         {QStringLiteral("success"), true},
         {QStringLiteral("fileName"), originalName},
         {QStringLiteral("savedAs"), saveName},
+        {QStringLiteral("path"), savedPath},
+        {QStringLiteral("directory"), directoryPath},
         {QStringLiteral("size"), static_cast<double>(fileData.size())}
     };
+    queueFileChange(savedPath);
     sendJson(socket, 200, QByteArrayLiteral("OK"),
              QJsonDocument(responseObject).toJson(QJsonDocument::Compact));
 }
@@ -900,6 +1271,7 @@ void LocalUploadServer::sendJson(QTcpSocket *socket, int statusCode,
     response += "HTTP/1.1 " + QByteArray::number(statusCode) + " " + reason + "\r\n";
     response += "Content-Type: application/json; charset=utf-8\r\n";
     response += "Content-Length: " + QByteArray::number(jsonBody.size()) + "\r\n";
+    response += "Cache-Control: no-store\r\n";
     response += "Connection: close\r\n\r\n";
     response += jsonBody;
     socket->write(response);

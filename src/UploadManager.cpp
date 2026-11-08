@@ -4,6 +4,7 @@
 
 #include <QClipboard>
 #include <QDateTime>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -197,6 +198,42 @@ QString fileIconColor(const QString &extension)
     return QStringLiteral("#4B6EF5");
 }
 
+bool normalizeCloudPath(const QString &path, QString *normalized)
+{
+    const QString value = QDir::fromNativeSeparators(path);
+    const QString cleaned = QDir::cleanPath(value);
+    if (value.contains(QLatin1Char('\0'))
+        || QDir::isAbsolutePath(value)
+        || cleaned == QStringLiteral("..")
+        || cleaned.startsWith(QStringLiteral("../"))
+        || cleaned.startsWith(QLatin1Char('/'))) {
+        return false;
+    }
+
+    *normalized = cleaned == QStringLiteral(".") ? QString() : cleaned;
+    return true;
+}
+
+bool isSyncingStatus(const QString &status)
+{
+    const QString value = status.trimmed().toLower();
+    return value == QStringLiteral("同步中")
+           || value == QStringLiteral("正在同步")
+           || value == QStringLiteral("上传中")
+           || value == QStringLiteral("syncing")
+           || value == QStringLiteral("uploading")
+           || value == QStringLiteral("in_progress");
+}
+
+bool isSyncedStatus(const QString &status)
+{
+    const QString value = status.trimmed().toLower();
+    return value == QStringLiteral("已同步")
+           || value == QStringLiteral("同步完成")
+           || value == QStringLiteral("synced")
+           || value == QStringLiteral("completed");
+}
+
 QVariantMap makeFileItem(const QJsonObject &object)
 {
     QString name = object.value(QStringLiteral("name")).toString();
@@ -278,10 +315,75 @@ UploadManager::UploadManager(QObject *parent)
     : QObject(parent)
     , m_network()
 {
+    m_reconnectTimer.setSingleShot(true);
+    m_refreshTimer.setSingleShot(true);
+    m_handshakeTimer.setSingleShot(true);
+    m_handshakeTimer.setInterval(15000);
+    m_pingTimer.setInterval(30000);
+
+    connect(&m_reconnectTimer, &QTimer::timeout,
+            this, &UploadManager::openWebSocket);
+    connect(&m_refreshTimer, &QTimer::timeout,
+            this, &UploadManager::loadFiles);
+    connect(&m_handshakeTimer, &QTimer::timeout, this, [this]() {
+        if (m_eventSocket.state() == QAbstractSocket::ConnectingState) {
+            setWebSocketStatus(QStringLiteral("实时同步连接超时，正在重试…"));
+            m_eventSocket.abort();
+            scheduleWebSocketReconnect();
+        }
+    });
+    connect(&m_pingTimer, &QTimer::timeout, this, [this]() {
+        if (m_eventSocket.state() == QAbstractSocket::ConnectedState)
+            m_eventSocket.ping();
+    });
+
+    connect(&m_eventSocket, &QWebSocket::connected, this, [this]() {
+        m_reconnectTimer.stop();
+        m_handshakeTimer.stop();
+        m_reconnectAttempt = 0;
+        setWebSocketConnected(true);
+        setWebSocketStatus(QStringLiteral("实时同步已连接"));
+        m_pingTimer.start();
+
+        // 断线期间可能错过事件，每次建立连接都进行一次全量对账。
+        scheduleFilesRefresh(0);
+    });
+    connect(&m_eventSocket, &QWebSocket::disconnected, this, [this]() {
+        m_handshakeTimer.stop();
+        m_pingTimer.stop();
+        setWebSocketConnected(false);
+        if (!m_shuttingDown) {
+            setWebSocketStatus(QStringLiteral("实时同步已断开，等待重连…"));
+            scheduleWebSocketReconnect();
+        }
+    });
+    connect(&m_eventSocket, &QWebSocket::textMessageReceived,
+            this, &UploadManager::handleWebSocketMessage);
+    connect(&m_eventSocket,
+            QOverload<QAbstractSocket::SocketError>::of(&QWebSocket::error),
+            this, [this](QAbstractSocket::SocketError) {
+        if (m_shuttingDown)
+            return;
+        setWebSocketStatus(QStringLiteral("实时同步连接异常：%1")
+                               .arg(m_eventSocket.errorString()));
+        qWarning().noquote() << QStringLiteral("WebSocket 错误：%1")
+                                    .arg(m_eventSocket.errorString());
+        if (m_eventSocket.state() == QAbstractSocket::UnconnectedState)
+            scheduleWebSocketReconnect();
+    });
+
+    // 延迟到事件循环启动后连接，让 QML 有机会先覆盖服务器地址。
+    QTimer::singleShot(0, this, &UploadManager::openWebSocket);
 }
 
 UploadManager::~UploadManager()
 {
+    m_shuttingDown = true;
+    m_reconnectTimer.stop();
+    m_refreshTimer.stop();
+    m_pingTimer.stop();
+    m_handshakeTimer.stop();
+    m_eventSocket.abort();
     resetDocumentPreparation();
 }
 
@@ -293,11 +395,24 @@ int UploadManager::progress() const { return m_progress; }
 QString UploadManager::currentFile() const { return m_currentFile; }
 QString UploadManager::statusText() const { return m_statusText; }
 QString UploadManager::listStatus() const { return m_listStatus; }
+QString UploadManager::currentPath() const { return m_currentPath; }
+int UploadManager::cloudFileCount() const { return m_cloudFileCount; }
+int UploadManager::syncedFileCount() const { return m_syncedFileCount; }
+int UploadManager::syncingFileCount() const { return m_syncingFileCount; }
 int UploadManager::completedCount() const { return m_completedCount; }
 int UploadManager::totalCount() const { return m_totalCount; }
 int UploadManager::successCount() const { return m_successCount; }
 int UploadManager::failedCount() const { return m_failedCount; }
 QString UploadManager::fileListUrl() const { return m_fileListUrl; }
+
+QString UploadManager::webSocketUrl() const
+{
+    return m_webSocketUrl.isEmpty()
+        ? derivedWebSocketUrl().toString(QUrl::FullyEncoded) : m_webSocketUrl;
+}
+
+bool UploadManager::webSocketConnected() const { return m_webSocketConnected; }
+QString UploadManager::webSocketStatus() const { return m_webSocketStatus; }
 
 void UploadManager::setServerUrl(const QString &url)
 {
@@ -315,36 +430,255 @@ void UploadManager::setFileListUrl(const QString &url)
         return;
     m_fileListUrl = trimmed;
     emit fileListUrlChanged();
+    if (m_webSocketUrl.isEmpty())
+        emit webSocketUrlChanged();
+    reconnectWebSocket();
 }
 
-void UploadManager::loadFiles()
+void UploadManager::setWebSocketUrl(const QString &url)
 {
-    if (m_loadingFiles)
+    const QString trimmed = url.trimmed();
+    if (m_webSocketUrl == trimmed)
+        return;
+    m_webSocketUrl = trimmed;
+    emit webSocketUrlChanged();
+    reconnectWebSocket();
+}
+
+QUrl UploadManager::derivedWebSocketUrl() const
+{
+    QUrl endpoint(m_fileListUrl);
+    const QString scheme = endpoint.scheme().toLower();
+    if (!endpoint.isValid()
+        || (scheme != QStringLiteral("http") && scheme != QStringLiteral("https"))) {
+        return {};
+    }
+
+    const int currentPort = endpoint.port(scheme == QStringLiteral("https") ? 443 : 80);
+    if (currentPort <= 0 || currentPort >= 65535)
+        return {};
+    endpoint.setPort(currentPort + 1);
+    endpoint.setScheme(scheme == QStringLiteral("https")
+                           ? QStringLiteral("wss") : QStringLiteral("ws"));
+
+    // 与 /files 保持相同 API 前缀，只替换最后一段。
+    QString basePath = endpoint.path();
+    const int lastSlash = basePath.lastIndexOf(QLatin1Char('/'));
+    basePath = lastSlash >= 0 ? basePath.left(lastSlash + 1) : QStringLiteral("/");
+    endpoint.setPath(basePath + QStringLiteral("events"));
+    endpoint.setQuery(QUrlQuery());
+    endpoint.setFragment(QString());
+    return endpoint;
+}
+
+void UploadManager::reconnectWebSocket()
+{
+    if (m_shuttingDown)
         return;
 
-    const QUrl endpoint(m_fileListUrl);
-    if (!endpoint.isValid()
-        || (endpoint.scheme() != QStringLiteral("http")
-            && endpoint.scheme() != QStringLiteral("https"))) {
-        const QString reason = QStringLiteral("文件列表地址无效：请填写 http 或 https 地址");
+    m_reconnectAttempt = 0;
+    m_reconnectTimer.stop();
+    m_handshakeTimer.stop();
+    if (m_eventSocket.state() != QAbstractSocket::UnconnectedState)
+        m_eventSocket.abort();
+    QTimer::singleShot(0, this, &UploadManager::openWebSocket);
+}
+
+void UploadManager::openWebSocket()
+{
+    if (m_shuttingDown)
+        return;
+
+    const QString endpointText = webSocketUrl();
+    const auto state = m_eventSocket.state();
+    if ((state == QAbstractSocket::ConnectedState
+         || state == QAbstractSocket::ConnectingState)
+        && m_activeWebSocketUrl == endpointText) {
+        return;
+    }
+    if (state != QAbstractSocket::UnconnectedState) {
+        m_eventSocket.abort();
+        QTimer::singleShot(0, this, &UploadManager::openWebSocket);
+        return;
+    }
+
+    const QUrl endpoint(endpointText);
+    if (!endpoint.isValid() || endpoint.host().isEmpty()
+        || (endpoint.scheme() != QStringLiteral("ws")
+            && endpoint.scheme() != QStringLiteral("wss"))) {
+        setWebSocketStatus(QStringLiteral("实时同步地址无效，请使用 ws 或 wss 地址"));
+        scheduleWebSocketReconnect();
+        return;
+    }
+
+    m_reconnectTimer.stop();
+    m_activeWebSocketUrl = endpointText;
+    setWebSocketStatus(QStringLiteral("正在连接实时同步服务…"));
+    m_handshakeTimer.start();
+    m_eventSocket.open(endpoint);
+}
+
+void UploadManager::scheduleWebSocketReconnect()
+{
+    if (m_shuttingDown || m_reconnectTimer.isActive()
+        || m_eventSocket.state() != QAbstractSocket::UnconnectedState) {
+        return;
+    }
+
+    const int exponent = qMin(m_reconnectAttempt, 5);
+    const int delayMs = qMin(30000, 1000 * (1 << exponent));
+    ++m_reconnectAttempt;
+    setWebSocketStatus(QStringLiteral("实时同步将在 %1 秒后重连")
+                           .arg(delayMs / 1000));
+    m_reconnectTimer.start(delayMs);
+}
+
+void UploadManager::scheduleFilesRefresh(int delayMs)
+{
+    if (m_shuttingDown || m_refreshTimer.isActive())
+        return;
+    m_refreshTimer.start(qMax(0, delayMs));
+}
+
+bool UploadManager::eventAffectsCurrentPath(const QStringList &paths) const
+{
+    if (paths.isEmpty() || m_currentPath.isEmpty())
+        return true;
+
+    const QString currentPrefix = m_currentPath + QLatin1Char('/');
+    for (const QString &rawPath : paths) {
+        QString path;
+        if (!normalizeCloudPath(rawPath, &path) || path.isEmpty())
+            return true; // 根目录或无法识别的路径按全量变更处理。
+        if (path == m_currentPath || path.startsWith(currentPrefix)
+            || m_currentPath.startsWith(path + QLatin1Char('/'))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void UploadManager::handleWebSocketMessage(const QString &message)
+{
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(message.toUtf8(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        qWarning().noquote() << QStringLiteral("忽略无效的 WebSocket 事件");
+        return;
+    }
+
+    const QJsonObject event = document.object();
+    const QString type = event.value(QStringLiteral("type")).toString();
+    const quint64 revision = event.value(QStringLiteral("revision"))
+                                 .toVariant().toULongLong();
+    if (type == QStringLiteral("ready")) {
+        // 服务器可能已重启，revision 以其最新连接消息为基准。
+        m_lastEventRevision = revision;
+        return;
+    }
+    if (type != QStringLiteral("filesChanged"))
+        return;
+    if (revision > 0 && revision <= m_lastEventRevision)
+        return;
+    m_lastEventRevision = revision;
+
+    QStringList paths;
+    const QJsonArray pathArray = event.value(QStringLiteral("paths")).toArray();
+    paths.reserve(pathArray.size());
+    for (const QJsonValue &value : pathArray)
+        paths.append(value.toString());
+
+    emit serverFilesChanged(paths, revision);
+    if (!eventAffectsCurrentPath(paths))
+        return;
+
+    setListStatus(QStringLiteral("检测到服务器文件变化，正在同步…"));
+    scheduleFilesRefresh();
+}
+
+void UploadManager::setWebSocketConnected(bool value)
+{
+    if (m_webSocketConnected == value)
+        return;
+    m_webSocketConnected = value;
+    emit webSocketConnectedChanged();
+}
+
+void UploadManager::setWebSocketStatus(const QString &value)
+{
+    if (m_webSocketStatus == value)
+        return;
+    m_webSocketStatus = value;
+    emit webSocketStatusChanged();
+}
+
+void UploadManager::openFolder(const QString &folderPath)
+{
+    QString normalized;
+    if (!normalizeCloudPath(folderPath, &normalized)) {
+        const QString reason = QStringLiteral("目录路径无效或不安全");
         setListStatus(reason);
         emit filesLoadFailed(reason);
         return;
     }
 
+    if (m_currentPath != normalized) {
+        m_currentPath = normalized;
+        m_serverSyncedFileCount = 0;
+        m_serverSyncingFileCount = 0;
+        setCloudFileCount(0);
+        setSyncedFileCount(0);
+        updateSyncingFileCount();
+        emit currentPathChanged();
+    }
+    loadFiles();
+}
+
+void UploadManager::loadFiles()
+{
+    // 目录切换以最后一次操作为准，取消旧请求，防止旧响应覆盖新目录。
+    if (m_listReply) {
+        QNetworkReply *oldReply = m_listReply;
+        m_listReply = nullptr;
+        disconnect(oldReply, nullptr, this, nullptr);
+        oldReply->abort();
+        oldReply->deleteLater();
+    }
+
+    QUrl endpoint(m_fileListUrl);
+    if (!endpoint.isValid()
+        || (endpoint.scheme() != QStringLiteral("http")
+            && endpoint.scheme() != QStringLiteral("https"))) {
+        const QString reason = QStringLiteral("文件列表地址无效：请填写 http 或 https 地址");
+        setLoadingFiles(false);
+        setListStatus(reason);
+        emit filesLoadFailed(reason);
+        return;
+    }
+
+    QUrlQuery query(endpoint);
+    query.removeQueryItem(QStringLiteral("path"));
+    if (!m_currentPath.isEmpty())
+        query.addQueryItem(QStringLiteral("path"), m_currentPath);
+    endpoint.setQuery(query);
+
     QNetworkRequest request(endpoint);
     request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setRawHeader(QByteArrayLiteral("Cache-Control"), QByteArrayLiteral("no-cache"));
     request.setTransferTimeout(30000);
 
     setLoadingFiles(true);
     setListStatus(QStringLiteral("正在从服务器加载文件列表…"));
-    m_listReply = m_network.get(request);
+    QNetworkReply *reply = m_network.get(request);
+    m_listReply = reply;
+    const QString requestedPath = m_currentPath;
 
-    connect(m_listReply, &QNetworkReply::finished, this, [this]() {
-        if (!m_listReply)
+    connect(reply, &QNetworkReply::finished, this, [this, reply, requestedPath]() {
+        if (reply != m_listReply) {
+            reply->deleteLater();
             return;
+        }
 
-        QNetworkReply *reply = m_listReply;
         m_listReply = nullptr;
         const QByteArray body = reply->readAll();
         const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -422,16 +756,56 @@ void UploadManager::loadFiles()
 
         QVariantList items;
         items.reserve(entries.size());
+        int derivedTotal = 0;
+        int derivedSynced = 0;
+        int derivedSyncing = 0;
         for (const QJsonValue &value : entries) {
             if (!value.isObject())
                 continue;
-            QVariantMap item = makeFileItem(value.toObject());
-            if (!item.value(QStringLiteral("name")).toString().isEmpty())
-                items.append(item);
+
+            const QJsonObject object = value.toObject();
+            QVariantMap item = makeFileItem(object);
+            if (item.value(QStringLiteral("name")).toString().isEmpty())
+                continue;
+
+            items.append(item);
+            if (item.value(QStringLiteral("kind")).toString() == QStringLiteral("folder"))
+                continue;
+
+            ++derivedTotal;
+            const QString status = item.value(QStringLiteral("status")).toString();
+            if (isSyncedStatus(status))
+                ++derivedSynced;
+            if (isSyncingStatus(status))
+                ++derivedSyncing;
         }
 
+        const QJsonValue totalValue = listObject.value(QStringLiteral("totalFiles"));
+        const QJsonValue syncedValue = listObject.value(QStringLiteral("syncedFiles"));
+        const QJsonValue syncingValue = listObject.value(QStringLiteral("syncingFiles"));
+        const int serverTotal = totalValue.isDouble() ? qMax(0, totalValue.toInt()) : derivedTotal;
+        const int serverSyncing = syncingValue.isDouble()
+            ? qBound(0, syncingValue.toInt(), serverTotal) : derivedSyncing;
+        int serverSynced = syncedValue.isDouble() ? qMax(0, syncedValue.toInt()) : derivedSynced;
+        if (!syncedValue.isDouble() && totalValue.isDouble() && derivedTotal != serverTotal) {
+            // 旧服务若只返回当前层条目和递归 totalFiles，未标记同步中的文件视为已同步。
+            serverSynced = qMax(0, serverTotal - serverSyncing);
+        }
+        serverSynced = qBound(0, serverSynced, qMax(0, serverTotal - serverSyncing));
+
+        m_serverSyncedFileCount = serverSynced;
+        m_serverSyncingFileCount = serverSyncing;
+        setCloudFileCount(serverTotal);
+        setSyncedFileCount(serverSynced);
+        updateSyncingFileCount();
+
         setLoadingFiles(false);
-        setListStatus(QStringLiteral("加载完成，共 %1 个文件/目录").arg(items.size()));
+        const QString location = requestedPath.isEmpty()
+            ? QStringLiteral("我的文件") : requestedPath;
+        setListStatus(QStringLiteral("%1：共 %2 个文件，当前层 %3 个项目")
+                          .arg(location)
+                          .arg(serverTotal)
+                          .arg(items.size()));
         emit filesLoaded(items);
     });
 }
@@ -476,7 +850,8 @@ void UploadManager::createFolder(const QString &folderName)
     request.setTransferTimeout(30000);
 
     const QJsonObject payload{
-        {QStringLiteral("name"), name}
+        {QStringLiteral("name"), name},
+        {QStringLiteral("path"), m_currentPath}
     };
 
     setCreatingFolder(true);
@@ -974,7 +1349,7 @@ void UploadManager::uploadFiles(const QVariantList &selectedFiles)
         return;
     }
 
-    const QUrl endpoint(m_serverUrl);
+    QUrl endpoint(m_serverUrl);
     if (!endpoint.isValid()
         || (endpoint.scheme() != QStringLiteral("http")
             && endpoint.scheme() != QStringLiteral("https"))) {
@@ -982,6 +1357,9 @@ void UploadManager::uploadFiles(const QVariantList &selectedFiles)
         emit fileUploadFailed(QString(), m_statusText);
         return;
     }
+
+    // 上传任务固定到发起时所在目录，即使用户随后切换目录也不会改变目标。
+    m_uploadDirectory = m_currentPath;
 
     m_queue.clear();
     m_totalBytes = 0;
@@ -1096,7 +1474,14 @@ void UploadManager::uploadNext()
     filePart.setBodyDevice(file);
     multiPart->append(filePart);
 
-    QNetworkRequest request{QUrl(m_serverUrl)};
+    QUrl endpoint(m_serverUrl);
+    QUrlQuery uploadQuery(endpoint);
+    uploadQuery.removeQueryItem(QStringLiteral("path"));
+    if (!m_uploadDirectory.isEmpty())
+        uploadQuery.addQueryItem(QStringLiteral("path"), m_uploadDirectory);
+    endpoint.setQuery(uploadQuery);
+
+    QNetworkRequest request{endpoint};
     request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
     request.setTransferTimeout(120000);
 
@@ -1183,6 +1568,7 @@ void UploadManager::setUploading(bool value)
         return;
     m_uploading = value;
     emit uploadingChanged();
+    updateSyncingFileCount();
 }
 
 void UploadManager::setLoadingFiles(bool value)
@@ -1234,12 +1620,47 @@ void UploadManager::setListStatus(const QString &value)
     emit listStatusChanged();
 }
 
+void UploadManager::setCloudFileCount(int value)
+{
+    value = qMax(0, value);
+    if (m_cloudFileCount == value)
+        return;
+    m_cloudFileCount = value;
+    emit cloudFileCountChanged();
+}
+
+void UploadManager::setSyncedFileCount(int value)
+{
+    value = qMax(0, value);
+    if (m_syncedFileCount == value)
+        return;
+    m_syncedFileCount = value;
+    emit syncedFileCountChanged();
+}
+
+void UploadManager::setSyncingFileCount(int value)
+{
+    value = qMax(0, value);
+    if (m_syncingFileCount == value)
+        return;
+    m_syncingFileCount = value;
+    emit syncingFileCountChanged();
+}
+
+void UploadManager::updateSyncingFileCount()
+{
+    const int activeUploads = m_uploading && m_uploadDirectory == m_currentPath
+        ? qMax(0, m_totalCount - m_completedCount) : 0;
+    setSyncingFileCount(m_serverSyncingFileCount + activeUploads);
+}
+
 void UploadManager::setCompletedCount(int value)
 {
     if (m_completedCount == value)
         return;
     m_completedCount = value;
     emit completedCountChanged();
+    updateSyncingFileCount();
 }
 
 void UploadManager::setTotalCount(int value)

@@ -9,7 +9,8 @@ import FileSyncComponents 1.0
  * 用法：
  *   FileManagerPage { anchors.fill: parent }
  *
- * 文件列表使用本地 ListModel；上传和新建文件夹已通过 C++ UploadManager 接入本地 HTTP 测试服务。
+ * 文件列表使用本地 ListModel；上传、列表和预览通过 C++ UploadManager 接入 HTTP 服务。
+ * 服务器文件变化通过 WebSocket 主动推送，客户端自动刷新当前目录并在断线后重连。
  * 下载、分享、删除、刷新和立即同步仍通过 signals 暴露给业务层。
  */
 Item {
@@ -40,15 +41,18 @@ Item {
     property string currentFilter: "全部"
     property string searchKeyword: ""
     property bool detailsVisible: true
-    property string selectedName: "项目资料"
-    property string selectedKind: "folder"
-    property string selectedModified: "今天 14:28"
-    property string selectedSize: "18 个文件"
-    property string selectedStatus: "已同步"
-    property string selectedExt: "文件夹"
+    property string selectedName: ""
+    property string selectedKind: ""
+    property string selectedModified: ""
+    property string selectedSize: ""
+    property string selectedStatus: ""
+    property string selectedExt: ""
     property string pendingCreatedFolderName: ""
     property string pendingCreatedFolderPath: ""
     property bool refreshAfterCurrentFileLoad: false
+    property var breadcrumbItems: root.makeBreadcrumbs(uploadManager.currentPath)
+    property string currentLocationText: uploadManager.currentPath.length === 0
+                                        ? "我的文件" : "我的文件 / " + uploadManager.currentPath
 
     // 供 C++ 业务层连接的接口
     signal uploadRequested()
@@ -67,6 +71,36 @@ Item {
     // 两个上传按钮共用独立的上传面板；新建文件夹沿用同样的异步请求模式。
     onUploadRequested: uploadDialog.open()
     onCreateFolderRequested: uploadManager.createFolder(folderName)
+    onRefreshRequested: uploadManager.loadFiles()
+
+    function makeBreadcrumbs(path) {
+        var items = [{ name: "我的文件", path: "" }]
+        if (path === undefined || path === null || path.length === 0)
+            return items
+
+        var parts = path.split("/")
+        var currentPath = ""
+        for (var i = 0; i < parts.length; ++i) {
+            if (parts[i].length === 0)
+                continue
+            currentPath = currentPath.length === 0 ? parts[i] : currentPath + "/" + parts[i]
+            items.push({ name: parts[i], path: currentPath })
+        }
+        return items
+    }
+
+    function openFolder(path) {
+        uploadManager.openFolder(path === undefined || path === null ? "" : path.toString())
+    }
+
+    function clearSelection() {
+        selectedName = ""
+        selectedKind = ""
+        selectedModified = ""
+        selectedSize = ""
+        selectedStatus = ""
+        selectedExt = ""
+    }
 
     function selectFile(name, kind, modified, size, status, ext) {
         selectedName = name
@@ -391,7 +425,7 @@ Item {
                         anchors.verticalCenter: parent.verticalCenter
                         Text {
                             anchors.centerIn: parent
-                            text: "2"
+                            text: uploadManager.syncingFileCount
                             color: root.primaryColor
                             font.pixelSize: 10
                             font.weight: Font.DemiBold
@@ -622,27 +656,75 @@ Item {
                             Layout.preferredHeight: 39
                             spacing: 8
 
-                            Row {
+                            ListView {
+                                id: breadcrumbView
                                 Layout.fillWidth: true
+                                Layout.preferredHeight: 39
+                                orientation: ListView.Horizontal
+                                model: root.breadcrumbItems
+                                currentIndex: Math.max(0, count - 1)
                                 spacing: 7
-                                Text {
-                                    text: "我的文件"
-                                    color: "#8794AA"
-                                    font.pixelSize: 11
-                                    anchors.verticalCenter: parent.verticalCenter
+                                clip: true
+                                interactive: contentWidth > width
+                                boundsBehavior: Flickable.StopAtBounds
+                                highlight: null
+
+                                // 等路径模型和代理尺寸更新后再定位，确保最后一级目录可见。
+                                function revealCurrentFolder() {
+                                    Qt.callLater(function() {
+                                        if (count <= 0 || contentWidth <= width) {
+                                            contentX = 0
+                                            return
+                                        }
+                                        positionViewAtIndex(count - 1, ListView.End)
+                                    })
                                 }
-                                Text {
-                                    text: "›"
-                                    color: "#C0C9D7"
-                                    font.pixelSize: 15
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-                                Text {
-                                    text: "全部文件"
-                                    color: root.textDarkColor
-                                    font.pixelSize: 11
-                                    font.weight: Font.DemiBold
-                                    anchors.verticalCenter: parent.verticalCenter
+
+                                onModelChanged: revealCurrentFolder()
+                                onCountChanged: revealCurrentFolder()
+                                onContentWidthChanged: revealCurrentFolder()
+                                onWidthChanged: revealCurrentFolder()
+                                Component.onCompleted: revealCurrentFolder()
+
+                                delegate: Item {
+                                    id: breadcrumbDelegate
+                                    readonly property bool isCurrent: index === breadcrumbView.currentIndex
+                                    width: breadcrumbDelegateRow.implicitWidth
+                                    height: breadcrumbView.height
+
+                                    Row {
+                                        id: breadcrumbDelegateRow
+                                        height: parent.height
+                                        spacing: 7
+
+                                        Text {
+                                            visible: index > 0
+                                            text: "›"
+                                            color: "#C0C9D7"
+                                            font.pixelSize: 15
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                        Text {
+                                            id: breadcrumbText
+                                            width: Math.min(implicitWidth, 180)
+                                            text: modelData.name
+                                            color: breadcrumbDelegate.isCurrent ? root.textDarkColor
+                                                   : (breadcrumbMouse.containsMouse ? root.primaryColor : "#8794AA")
+                                            font.pixelSize: 11
+                                            font.weight: breadcrumbDelegate.isCurrent ? Font.DemiBold : Font.Normal
+                                            elide: Text.ElideRight
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        id: breadcrumbMouse
+                                        anchors.fill: parent
+                                        enabled: !breadcrumbDelegate.isCurrent
+                                        hoverEnabled: true
+                                        cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                        onClicked: root.openFolder(modelData.path)
+                                    }
                                 }
                             }
 
@@ -716,9 +798,14 @@ Item {
 
                             Repeater {
                                 model: [
-                                    { label: "文件总数", value: "128", note: "较上周 +12", icon: "▤", tint: "#EEF2FF", ink: "#4B6EF5" },
-                                    { label: "已完成同步", value: "124", note: "云端状态正常", icon: "✓", tint: "#EAF8F2", ink: "#28B985" },
-                                    { label: "正在同步", value: "2", note: "任务进行中", icon: "↻", tint: "#FFF5E8", ink: "#E8A044" }
+                                    { label: "文件总数", value: uploadManager.cloudFileCount,
+                                      note: uploadManager.loadingFiles ? "正在刷新…" : "当前目录及子目录",
+                                      icon: "▤", tint: "#EEF2FF", ink: "#4B6EF5" },
+                                    { label: "已完成同步", value: uploadManager.syncedFileCount,
+                                      note: "云端已保存", icon: "✓", tint: "#EAF8F2", ink: "#28B985" },
+                                    { label: "正在同步", value: uploadManager.syncingFileCount,
+                                      note: uploadManager.syncingFileCount > 0 ? "任务进行中" : "暂无同步任务",
+                                      icon: "↻", tint: "#FFF5E8", ink: "#E8A044" }
                                 ]
                                 delegate: Rectangle {
                                     Layout.fillWidth: true
@@ -1088,7 +1175,7 @@ Item {
                                             onClicked: root.selectFile(name, kind, modified, size, status, ext)
                                             onDoubleClicked: {
                                                 if (kind === "folder") {
-                                                    root.openFileRequested(name)
+                                                    root.openFolder(fileRow.filePath)
                                                     return
                                                 }
 
@@ -1519,18 +1606,24 @@ Item {
                                             width: 6
                                             height: 6
                                             radius: 3
-                                            color: root.successColor
+                                            color: uploadManager.webSocketConnected
+                                                   ? root.successColor : root.warningColor
                                             anchors.verticalCenter: parent.verticalCenter
                                         }
                                         Text {
-                                            text: "所有文件均已安全保存至云端"
+                                            text: uploadManager.syncingFileCount > 0
+                                                  ? uploadManager.syncingFileCount + " 个文件正在同步"
+                                                  : (uploadManager.webSocketConnected
+                                                     ? "实时同步已连接，当前目录文件均已安全保存至云端"
+                                                     : uploadManager.webSocketStatus)
                                             color: "#9AA7B9"
                                             font.pixelSize: 9
                                             anchors.verticalCenter: parent.verticalCenter
                                         }
                                         Item { width: 1; height: 1 }
                                         Text {
-                                            text: "最后同步：刚刚"
+                                            text: uploadManager.webSocketConnected
+                                                  ? "WebSocket 推送正常" : "手动刷新仍可使用"
                                             color: "#AAB4C3"
                                             font.pixelSize: 9
                                             anchors.verticalCenter: parent.verticalCenter
@@ -1653,7 +1746,7 @@ Item {
                             model: [
                                 { key: "文件大小", value: root.selectedSize },
                                 { key: "修改时间", value: root.selectedModified },
-                                { key: "所在位置", value: "我的文件" }
+                                { key: "所在位置", value: root.currentLocationText }
                             ]
                             delegate: Row {
                                 width: parent.width
@@ -2406,10 +2499,10 @@ Item {
 
                 Text {
                     Layout.fillWidth: true
-                    text: "将在“我的文件”中创建一个空文件夹。"
+                    text: "将在“" + root.currentLocationText + "”中创建一个空文件夹。"
                     color: root.textMidColor
                     font.pixelSize: 11
-                    elide: Text.ElideRight
+                    wrapMode: Text.WordWrap
                 }
 
                 Rectangle {
@@ -2492,24 +2585,31 @@ Item {
                                    : confirmCreateFolderButton.down ? root.primaryDarkColor
                                    : confirmCreateFolderButton.hovered ? "#5878F7" : root.primaryColor
                         }
-                        contentItem: Row {
-                            anchors.centerIn: parent
-                            spacing: 6
+                        contentItem: Item {
+                            implicitWidth: createContentRow.implicitWidth
+                            implicitHeight: createContentRow.implicitHeight
 
-                            BusyIndicator {
-                                width: 16
-                                height: 16
-                                anchors.verticalCenter: parent.verticalCenter
-                                running: uploadManager.creatingFolder
-                                visible: running
-                            }
-                            Text {
-                                text: uploadManager.creatingFolder ? "创建中…" : "创建"
-                                color: "#FFFFFF"
-                                font.pixelSize: 11
-                                font.weight: Font.DemiBold
-                                anchors.verticalCenter: parent.verticalCenter
-                                anchors.horizontalCenter: parent.horizontalCenter
+                            Row {
+                                id: createContentRow
+                                anchors.centerIn: parent
+                                spacing: 6
+
+                                BusyIndicator {
+                                    width: 16
+                                    height: 16
+                                    running: uploadManager.creatingFolder
+                                    visible: running
+                                }
+
+                                Text {
+                                    text: uploadManager.creatingFolder ? "创建中…" : "创建"
+                                    color: "#FFFFFF"
+                                    font.pixelSize: 11
+                                    font.weight: Font.DemiBold
+
+                                    height: 16
+                                    verticalAlignment: Text.AlignVCenter
+                                }
                             }
                         }
                         onClicked: createFolderDialog.submit()
@@ -2528,6 +2628,18 @@ Item {
 
     Connections {
         target: uploadManager
+
+        function onCurrentPathChanged() {
+            fileModel.clear()
+            root.pendingCreatedFolderName = ""
+            root.pendingCreatedFolderPath = ""
+            root.refreshAfterCurrentFileLoad = false
+            root.currentFilter = "全部"
+            root.searchKeyword = ""
+            searchField.text = ""
+            root.clearSelection()
+            rowMenu.close()
+        }
 
         // 服务器文件列表加载成功
         function onFilesLoaded(items) {
@@ -2562,7 +2674,7 @@ Item {
                 }
             }
 
-            // loadFiles() 在加载中会直接返回；旧请求结束后补发一次，避免旧列表覆盖创建结果。
+            // 若创建前已有列表请求，新请求已取代旧请求；未找到新文件夹时再补查一次。
             if (shouldReloadAfterCurrentLoad) {
                 root.refreshAfterCurrentFileLoad = false
                 if (!foundCreatedFolder)
@@ -2576,7 +2688,9 @@ Item {
             root.refreshAfterCurrentFileLoad = uploadManager.loadingFiles
             createFolderDialog.errorText = ""
             createFolderDialog.close()
-            uploadManager.loadFiles()
+            // 在线时由服务器 filesChanged 事件驱动刷新；离线时保留原 HTTP 兜底。
+            if (!uploadManager.webSocketConnected)
+                uploadManager.loadFiles()
         }
 
         function onFolderCreationFailed(folderName, reason) {
@@ -2585,46 +2699,9 @@ Item {
             folderNameField.selectAll()
         }
 
-        // 单个文件上传成功
-        function onFileUploaded(fileName, displaySize, modifiedText) {
-            var dot = fileName.lastIndexOf(".")
-            var ext = dot >= 0
-                    ? fileName.substring(dot + 1).toUpperCase()
-                    : "FILE"
-
-            var item = {
-                name: fileName,
-                kind: "file",
-                ext: ext,
-                modified: modifiedText,
-                size: displaySize,
-                status: "已同步",
-                iconBg: "#EEF2FF",
-                iconColor: "#4B6EF5",
-                path: fileName,
-                previewType: root.previewTypeForExtension(ext),
-                mimeType: ""
-            }
-
-            // 避免同名文件重复插入
-            var found = -1
-
-            for (var i = 0; i < fileModel.count; ++i) {
-                if (fileModel.get(i).name === fileName) {
-                    found = i
-                    break
-                }
-            }
-
-            if (found >= 0)
-                fileModel.set(found, item)
-            else
-                fileModel.insert(0, item)
-        }
-
-        // 所有上传任务完成
+        // 所有上传任务完成。在线时等待服务器事件，避免每个文件都重复刷新。
         function onUploadFinished(successCount, failedCount) {
-            if (successCount > 0)
+            if (successCount > 0 && !uploadManager.webSocketConnected)
                 uploadManager.loadFiles()
         }
 
@@ -2636,6 +2713,8 @@ Item {
             }
         }
     }
+
+
     Component.onCompleted: {
         uploadManager.loadFiles()
     }

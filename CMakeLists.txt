@@ -5,7 +5,7 @@ project(FileSync VERSION 1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Quick QuickControls2 Network)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Quick QuickControls2 Network WebSockets)
 
 find_package(ZLIB QUIET)
 
@@ -222,6 +222,7 @@ target_link_libraries(FileSync PRIVATE
     Qt6::Network
     Qt6::Quick
     Qt6::QuickControls2
+    Qt6::WebSockets
     ZLIB::ZLIB
     MuPDF::MuPDF
     FileSyncComponents
