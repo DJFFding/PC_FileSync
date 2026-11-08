@@ -367,7 +367,8 @@ ApplicationWindow {
 
                         FileSection {
                             id: fileSection
-
+                            maximized: window.visibility === Window.Maximized
+                            cornerRadius: window.windowCornerRadius
                             onPreviewRequested: function(fileName, filePath, previewType,
                                                          extension, mimeType) {
                                 filePreviewDialog.openPreview(fileName, filePath, previewType,

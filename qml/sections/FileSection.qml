@@ -18,6 +18,11 @@ Item {
     id: root
     objectName: "fileManagerPage"
 
+    // 非最大化时的圆角
+    property real cornerRadius: 14
+    // 当前窗口是否最大化
+    property bool maximized: false
+
     // 可由 C++ 设置为 QAbstractListModel；模型角色需包含 name/kind/ext/modified/size/status/iconBg/iconColor。
     // 文件预览使用 path；服务端还可提供 previewType（image/text/binary）和 mimeType。
     property var fileModelSource: fileModel
@@ -246,6 +251,8 @@ Item {
     Rectangle {
         anchors.fill: parent
         color: root.pageColor
+        bottomRightRadius: root.maximized ? 0 : root.cornerRadius
+        antialiasing: true
     }
 
     Row {
@@ -586,11 +593,12 @@ Item {
         // ============================================================
         // 右侧工作区
         // ============================================================
-        Item {
+        Rectangle {
             id: workspace
             width: parent.width - sidebar.width
             height: parent.height
-
+            bottomRightRadius: root.maximized ? 0 : root.cornerRadius
+            antialiasing: true
             Row {
                 anchors.fill: parent
                 spacing: 0
@@ -1695,6 +1703,8 @@ Item {
                     color: "#FFFFFF"
                     border.color: "#E9EEF6"
                     border.width: 1
+                    bottomRightRadius: root.maximized ? 0 : root.cornerRadius
+                    antialiasing: true
 
                     Column {
                         anchors.fill: parent
