@@ -5,11 +5,13 @@
 #include <QClipboard>
 #include <QDateTime>
 #include <QDebug>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QHttpMultiPart>
+#include <QIODevice>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -17,6 +19,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QProcess>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTemporaryFile>
@@ -93,6 +96,62 @@ QString processOutput(QProcess *process)
     if (text.size() > maxMessageLength)
         text = QStringLiteral("…") + text.right(maxMessageLength);
     return text;
+}
+
+QString fileNameForPath(const QString &path)
+{
+    const QUrl directUrl(path);
+    const QString scheme = directUrl.scheme().toLower();
+    if (directUrl.isValid()
+        && (scheme == QStringLiteral("http")
+            || scheme == QStringLiteral("https")
+            || scheme == QStringLiteral("file")
+            || scheme == QStringLiteral("qrc"))) {
+        return QFileInfo(directUrl.path(QUrl::FullyDecoded)).fileName();
+    }
+    return QFileInfo(QDir::fromNativeSeparators(path)).fileName();
+}
+
+// file/qrc 地址与网络下载共用同一个输出设备，避免为大文件额外分配完整内存缓冲区。
+bool copyUrlToDevice(const QUrl &sourceUrl, QIODevice *target, QString *error)
+{
+    if (!target || !target->isOpen() || !target->isWritable()) {
+        *error = QStringLiteral("目标文件不可写");
+        return false;
+    }
+
+    QString sourcePath;
+    const QString scheme = sourceUrl.scheme().toLower();
+    if (scheme == QStringLiteral("file")) {
+        sourcePath = sourceUrl.toLocalFile();
+    } else if (scheme == QStringLiteral("qrc")) {
+        sourcePath = QStringLiteral(":") + sourceUrl.path();
+    } else {
+        *error = QStringLiteral("不支持此文件地址协议：%1").arg(scheme);
+        return false;
+    }
+
+    QFile source(sourcePath);
+    if (!source.open(QIODevice::ReadOnly)) {
+        *error = QStringLiteral("无法读取源文件：%1").arg(source.errorString());
+        return false;
+    }
+
+    while (!source.atEnd()) {
+        const QByteArray data = source.read(64 * 1024);
+        if (data.isEmpty()) {
+            if (source.error() != QFileDevice::NoError)
+                *error = QStringLiteral("读取源文件失败：%1").arg(source.errorString());
+            else
+                *error = QStringLiteral("读取源文件时发生意外中断");
+            return false;
+        }
+        if (target->write(data) != data.size()) {
+            *error = QStringLiteral("写入目标文件失败：%1").arg(target->errorString());
+            return false;
+        }
+    }
+    return true;
 }
 
 bool validateFolderName(const QString &folderName, QString *error)
@@ -384,6 +443,12 @@ UploadManager::~UploadManager()
     m_pingTimer.stop();
     m_handshakeTimer.stop();
     m_eventSocket.abort();
+    resetOpenFile();
+    resetDownload();
+    resetFolderDownload();
+    for (QTemporaryFile *file : m_openedFiles)
+        delete file;
+    m_openedFiles.clear();
     resetDocumentPreparation();
 }
 
@@ -391,6 +456,8 @@ QString UploadManager::serverUrl() const { return m_serverUrl; }
 bool UploadManager::uploading() const { return m_uploading; }
 bool UploadManager::loadingFiles() const { return m_loadingFiles; }
 bool UploadManager::creatingFolder() const { return m_creatingFolder; }
+bool UploadManager::openingFile() const { return m_openingFile; }
+bool UploadManager::downloading() const { return m_downloading; }
 int UploadManager::progress() const { return m_progress; }
 QString UploadManager::currentFile() const { return m_currentFile; }
 QString UploadManager::statusText() const { return m_statusText; }
@@ -918,6 +985,706 @@ void UploadManager::createFolder(const QString &folderName)
         setListStatus(QStringLiteral("文件夹“%1”创建成功").arg(actualName));
         emit folderCreated(actualName, folderPath, modifiedText);
     });
+}
+
+void UploadManager::openFile(const QString &path)
+{
+    const QString requestedPath = path.trimmed();
+    if (m_openingFile) {
+        const QString reason = QStringLiteral("正在打开其他文件，请稍后再试");
+        setListStatus(reason);
+        emit fileOpenFailed(requestedPath, reason);
+        return;
+    }
+
+    m_openCloudPath = requestedPath;
+    if (requestedPath.isEmpty()) {
+        failFileOpen(QStringLiteral("文件路径为空"));
+        return;
+    }
+
+    const QUrl sourceUrl(fileContentUrl(requestedPath));
+    const QString scheme = sourceUrl.scheme().toLower();
+    if (!sourceUrl.isValid() || scheme.isEmpty()) {
+        failFileOpen(QStringLiteral("文件地址无效"));
+        return;
+    }
+
+    // 外部模型若直接提供本地文件，无需再复制到临时目录。
+    if (scheme == QStringLiteral("file")) {
+        const QString localPath = sourceUrl.toLocalFile();
+        const QFileInfo info(localPath);
+        if (!info.exists() || !info.isFile() || !info.isReadable()) {
+            failFileOpen(QStringLiteral("本地文件不存在或无法读取"));
+            return;
+        }
+        if (!QDesktopServices::openUrl(sourceUrl)) {
+            failFileOpen(QStringLiteral("系统无法找到可打开此文件的程序"));
+            return;
+        }
+
+        const QString cloudPath = m_openCloudPath;
+        m_openCloudPath.clear();
+        setListStatus(QStringLiteral("已打开文件：%1").arg(info.fileName()));
+        emit fileOpened(cloudPath, info.absoluteFilePath());
+        return;
+    }
+
+    if (scheme != QStringLiteral("http")
+        && scheme != QStringLiteral("https")
+        && scheme != QStringLiteral("qrc")) {
+        failFileOpen(QStringLiteral("不支持此文件地址协议：%1").arg(scheme));
+        return;
+    }
+
+    // 保留原扩展名，Windows 和 macOS 才能据此选择合适的默认程序。
+    QString suffix = QFileInfo(fileNameForPath(requestedPath)).suffix();
+    if (suffix.size() > 32)
+        suffix = suffix.left(32);
+    const QString temporaryPattern = QDir(QDir::tempPath()).filePath(
+        QStringLiteral("FileSyncOpen_XXXXXX%1")
+            .arg(suffix.isEmpty() ? QString() : QStringLiteral(".") + suffix));
+    m_openFile = new QTemporaryFile(temporaryPattern, this);
+    if (!m_openFile->open()) {
+        failFileOpen(QStringLiteral("无法创建打开文件所需的临时文件：%1")
+                         .arg(m_openFile->errorString()));
+        return;
+    }
+
+    setOpeningFile(true);
+    setListStatus(QStringLiteral("正在准备打开：%1")
+                      .arg(fileNameForPath(requestedPath)));
+
+    if (scheme == QStringLiteral("qrc")) {
+        QString error;
+        if (!copyUrlToDevice(sourceUrl, m_openFile, &error)) {
+            failFileOpen(error);
+            return;
+        }
+        finishOpenFile();
+        return;
+    }
+
+    QNetworkRequest request(sourceUrl);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/octet-stream"));
+    request.setRawHeader(QByteArrayLiteral("Cache-Control"), QByteArrayLiteral("no-cache"));
+    request.setTransferTimeout(120000);
+
+    QNetworkReply *reply = m_network.get(request);
+    m_openReply = reply;
+    connect(reply, &QIODevice::readyRead, this, [this, reply]() {
+        if (reply != m_openReply)
+            return;
+
+        const QByteArray data = reply->readAll();
+        if (!data.isEmpty()
+            && (!m_openFile || m_openFile->write(data) != data.size())) {
+            failFileOpen(QStringLiteral("写入打开文件所需的临时文件失败"));
+        }
+    });
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        if (reply != m_openReply)
+            return;
+
+        m_openReply = nullptr;
+        const int httpStatus = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        QString error;
+        if (reply->error() != QNetworkReply::NoError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = reply->errorString();
+            if (httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        }
+        const QByteArray remainingData = reply->readAll();
+        reply->deleteLater();
+
+        if (!error.isEmpty()) {
+            failFileOpen(QStringLiteral("文件下载失败：%1").arg(error));
+            return;
+        }
+        if (!remainingData.isEmpty()
+            && (!m_openFile || m_openFile->write(remainingData) != remainingData.size())) {
+            failFileOpen(QStringLiteral("写入打开文件所需的临时文件失败"));
+            return;
+        }
+        finishOpenFile();
+    });
+}
+
+void UploadManager::finishOpenFile()
+{
+    if (!m_openFile) {
+        failFileOpen(QStringLiteral("打开文件所需的临时文件不存在"));
+        return;
+    }
+    if (!m_openFile->flush()) {
+        failFileOpen(QStringLiteral("临时文件写入不完整：%1")
+                         .arg(m_openFile->errorString()));
+        return;
+    }
+
+    const QString localPath = m_openFile->fileName();
+    m_openFile->close();
+    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(localPath))) {
+        failFileOpen(QStringLiteral("系统无法找到可打开此文件的程序"));
+        return;
+    }
+
+    const QString cloudPath = m_openCloudPath;
+    m_openedFiles.append(m_openFile);
+    m_openFile = nullptr;
+    m_openCloudPath.clear();
+    setOpeningFile(false);
+    setListStatus(QStringLiteral("已打开文件：%1").arg(QFileInfo(localPath).fileName()));
+    emit fileOpened(cloudPath, localPath);
+}
+
+void UploadManager::failFileOpen(const QString &reason)
+{
+    const QString cloudPath = m_openCloudPath;
+    resetOpenFile();
+    m_openCloudPath.clear();
+    setOpeningFile(false);
+    setListStatus(QStringLiteral("打开文件失败：%1").arg(reason));
+    emit fileOpenFailed(cloudPath, reason);
+}
+
+void UploadManager::resetOpenFile()
+{
+    if (m_openReply) {
+        QNetworkReply *reply = m_openReply;
+        m_openReply = nullptr;
+        disconnect(reply, nullptr, this, nullptr);
+        reply->abort();
+        reply->deleteLater();
+    }
+    delete m_openFile;
+    m_openFile = nullptr;
+}
+
+QUrl UploadManager::defaultDownloadUrl(const QString &path) const
+{
+    QString fileName = fileNameForPath(path.trimmed());
+    if (fileName.isEmpty())
+        fileName = QStringLiteral("download.bin");
+
+    QString directory = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    if (directory.isEmpty())
+        directory = QStandardPaths::writableLocation(QStandardPaths::HomeLocation);
+    if (directory.isEmpty())
+        directory = QDir::currentPath();
+    QDir().mkpath(directory);
+    return QUrl::fromLocalFile(QDir(directory).filePath(fileName));
+}
+
+void UploadManager::downloadFile(const QString &path, const QUrl &destination)
+{
+    const QString requestedPath = path.trimmed();
+    if (m_downloading) {
+        const QString reason = QStringLiteral("正在下载其他内容，请稍后再试");
+        setListStatus(reason);
+        emit fileDownloadFailed(requestedPath, reason);
+        return;
+    }
+    startFileDownload(requestedPath, destination);
+}
+
+void UploadManager::startFileDownload(const QString &path, const QUrl &destination)
+{
+    const QString requestedPath = path.trimmed();
+    m_downloadCloudPath = requestedPath;
+    m_downloadLocalPath.clear();
+    if (requestedPath.isEmpty()) {
+        failDownload(QStringLiteral("文件路径为空"));
+        return;
+    }
+    if (!destination.isValid() || !destination.isLocalFile()) {
+        failDownload(QStringLiteral("请选择有效的本地保存位置"));
+        return;
+    }
+
+    const QUrl sourceUrl(fileContentUrl(requestedPath));
+    const QString scheme = sourceUrl.scheme().toLower();
+    if (!sourceUrl.isValid() || scheme.isEmpty()) {
+        failDownload(QStringLiteral("文件地址无效"));
+        return;
+    }
+    if (scheme != QStringLiteral("http")
+        && scheme != QStringLiteral("https")
+        && scheme != QStringLiteral("file")
+        && scheme != QStringLiteral("qrc")) {
+        failDownload(QStringLiteral("不支持此文件地址协议：%1").arg(scheme));
+        return;
+    }
+
+    m_downloadLocalPath = destination.toLocalFile();
+    const QFileInfo destinationInfo(m_downloadLocalPath);
+    if (m_downloadLocalPath.isEmpty() || destinationInfo.isDir()) {
+        failDownload(QStringLiteral("保存位置不是有效文件路径"));
+        return;
+    }
+    if (!QDir(destinationInfo.absolutePath()).exists()) {
+        failDownload(QStringLiteral("保存目录不存在"));
+        return;
+    }
+
+    m_downloadFile = new QSaveFile(m_downloadLocalPath, this);
+    if (!m_downloadFile->open(QIODevice::WriteOnly)) {
+        failDownload(QStringLiteral("无法写入保存位置：%1")
+                         .arg(m_downloadFile->errorString()));
+        return;
+    }
+
+    setDownloading(true);
+    if (m_folderDownloadActive) {
+        setListStatus(QStringLiteral("正在下载文件夹：%1/%2 个文件，当前：%3")
+                          .arg(m_folderCompletedFiles + 1)
+                          .arg(m_folderTotalFiles)
+                          .arg(fileNameForPath(requestedPath)));
+    } else {
+        setListStatus(QStringLiteral("正在下载：%1")
+                          .arg(fileNameForPath(requestedPath)));
+    }
+
+    if (scheme == QStringLiteral("file") || scheme == QStringLiteral("qrc")) {
+        QString error;
+        if (!copyUrlToDevice(sourceUrl, m_downloadFile, &error)) {
+            failDownload(error);
+            return;
+        }
+        finishDownload();
+        return;
+    }
+
+    QNetworkRequest request(sourceUrl);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/octet-stream"));
+    request.setRawHeader(QByteArrayLiteral("Cache-Control"), QByteArrayLiteral("no-cache"));
+    request.setTransferTimeout(120000);
+
+    QNetworkReply *reply = m_network.get(request);
+    m_downloadReply = reply;
+    connect(reply, &QIODevice::readyRead, this, [this, reply]() {
+        if (reply != m_downloadReply)
+            return;
+
+        const QByteArray data = reply->readAll();
+        if (!data.isEmpty()
+            && (!m_downloadFile || m_downloadFile->write(data) != data.size())) {
+            failDownload(QStringLiteral("写入下载文件失败"));
+        }
+    });
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        if (reply != m_downloadReply)
+            return;
+
+        m_downloadReply = nullptr;
+        const int httpStatus = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        QString error;
+        if (reply->error() != QNetworkReply::NoError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = reply->errorString();
+            if (httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        }
+        const QByteArray remainingData = reply->readAll();
+        reply->deleteLater();
+
+        if (!error.isEmpty()) {
+            failDownload(QStringLiteral("文件下载失败：%1").arg(error));
+            return;
+        }
+        if (!remainingData.isEmpty()
+            && (!m_downloadFile
+                || m_downloadFile->write(remainingData) != remainingData.size())) {
+            failDownload(QStringLiteral("写入下载文件失败"));
+            return;
+        }
+        finishDownload();
+    });
+}
+
+void UploadManager::finishDownload()
+{
+    if (!m_downloadFile) {
+        failDownload(QStringLiteral("下载目标文件不存在"));
+        return;
+    }
+    if (!m_downloadFile->commit()) {
+        failDownload(QStringLiteral("无法完成下载文件写入：%1")
+                         .arg(m_downloadFile->errorString()));
+        return;
+    }
+
+    if (m_folderDownloadActive) {
+        ++m_folderCompletedFiles;
+        delete m_downloadFile;
+        m_downloadFile = nullptr;
+        m_downloadCloudPath.clear();
+        m_downloadLocalPath.clear();
+        setListStatus(QStringLiteral("正在下载文件夹：%1/%2 个文件")
+                          .arg(m_folderCompletedFiles)
+                          .arg(m_folderTotalFiles));
+        QTimer::singleShot(0, this, &UploadManager::downloadNextFolderFile);
+        return;
+    }
+
+    const QString cloudPath = m_downloadCloudPath;
+    const QString localPath = m_downloadLocalPath;
+    delete m_downloadFile;
+    m_downloadFile = nullptr;
+    m_downloadCloudPath.clear();
+    m_downloadLocalPath.clear();
+    setDownloading(false);
+    setListStatus(QStringLiteral("下载完成：%1").arg(localPath));
+    emit fileDownloaded(cloudPath, localPath);
+}
+
+void UploadManager::failDownload(const QString &reason)
+{
+    if (m_folderDownloadActive) {
+        failFolderDownload(reason);
+        return;
+    }
+
+    const QString cloudPath = m_downloadCloudPath;
+    resetDownload();
+    m_downloadCloudPath.clear();
+    m_downloadLocalPath.clear();
+    setDownloading(false);
+    setListStatus(QStringLiteral("下载失败：%1").arg(reason));
+    emit fileDownloadFailed(cloudPath, reason);
+}
+
+void UploadManager::resetDownload()
+{
+    if (m_downloadReply) {
+        QNetworkReply *reply = m_downloadReply;
+        m_downloadReply = nullptr;
+        disconnect(reply, nullptr, this, nullptr);
+        reply->abort();
+        reply->deleteLater();
+    }
+    if (m_downloadFile) {
+        if (m_downloadFile->isOpen())
+            m_downloadFile->cancelWriting();
+        delete m_downloadFile;
+        m_downloadFile = nullptr;
+    }
+}
+
+void UploadManager::downloadFolder(const QString &path, const QUrl &destination)
+{
+    const QString requestedPath = path.trimmed();
+    auto failStart = [this, requestedPath](const QString &reason) {
+        setListStatus(QStringLiteral("文件夹下载失败：%1").arg(reason));
+        emit folderDownloadFailed(requestedPath, reason);
+    };
+
+    if (m_downloading) {
+        failStart(QStringLiteral("正在下载其他内容，请稍后再试"));
+        return;
+    }
+
+    QString normalizedPath;
+    if (!normalizeCloudPath(requestedPath, &normalizedPath) || normalizedPath.isEmpty()) {
+        failStart(QStringLiteral("文件夹路径无效或不安全"));
+        return;
+    }
+    if (!destination.isValid() || !destination.isLocalFile()) {
+        failStart(QStringLiteral("请选择有效的本地保存目录"));
+        return;
+    }
+
+    const QFileInfo destinationInfo(destination.toLocalFile());
+    if (!destinationInfo.exists() || !destinationInfo.isDir()) {
+        failStart(QStringLiteral("保存位置不是有效目录"));
+        return;
+    }
+
+    QString folderName = fileNameForPath(normalizedPath);
+    if (folderName.isEmpty())
+        folderName = QStringLiteral("下载的文件夹");
+
+    // 自动避开已有目录，禁止把本次文件合并或覆盖到用户的同名目录中。
+    const QDir destinationDirectory(destinationInfo.absoluteFilePath());
+    QString candidateName = folderName;
+    QString localRoot = destinationDirectory.filePath(candidateName);
+    int suffix = 0;
+    while (QFileInfo::exists(localRoot)) {
+        candidateName = QStringLiteral("%1 (%2)").arg(folderName).arg(++suffix);
+        localRoot = destinationDirectory.filePath(candidateName);
+    }
+    if (!QDir().mkpath(localRoot)) {
+        failStart(QStringLiteral("无法创建本地保存文件夹"));
+        return;
+    }
+
+    resetFolderDownload();
+    m_folderCloudPath = normalizedPath;
+    m_folderLocalRoot = QDir(localRoot).absolutePath();
+    m_folderPendingDirectories.enqueue(normalizedPath);
+    m_folderKnownDirectories.insert(normalizedPath);
+    m_folderDownloadActive = true;
+    setDownloading(true);
+    setListStatus(QStringLiteral("正在扫描文件夹：%1").arg(folderName));
+    processNextFolderDirectory();
+}
+
+void UploadManager::processNextFolderDirectory()
+{
+    if (!m_folderDownloadActive || m_shuttingDown)
+        return;
+    if (m_folderPendingDirectories.isEmpty()) {
+        downloadNextFolderFile();
+        return;
+    }
+
+    QUrl endpoint(m_fileListUrl);
+    if (!endpoint.isValid()
+        || (endpoint.scheme() != QStringLiteral("http")
+            && endpoint.scheme() != QStringLiteral("https"))) {
+        failFolderDownload(QStringLiteral("文件列表地址无效"));
+        return;
+    }
+
+    const QString requestedDirectory = m_folderPendingDirectories.dequeue();
+    QUrlQuery query(endpoint);
+    query.removeQueryItem(QStringLiteral("path"));
+    query.addQueryItem(QStringLiteral("path"), requestedDirectory);
+    endpoint.setQuery(query);
+
+    QNetworkRequest request(endpoint);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setRawHeader(QByteArrayLiteral("Cache-Control"), QByteArrayLiteral("no-cache"));
+    request.setTransferTimeout(30000);
+
+    QNetworkReply *reply = m_network.get(request);
+    m_folderListReply = reply;
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, requestedDirectory]() {
+        if (reply != m_folderListReply || !m_folderDownloadActive)
+            return;
+
+        m_folderListReply = nullptr;
+        const QByteArray body = reply->readAll();
+        const int httpStatus = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        QString error;
+        if (reply->error() != QNetworkReply::NoError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = reply->errorString();
+            if (httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        }
+        reply->deleteLater();
+
+        if (!error.isEmpty()) {
+            failFolderDownload(QStringLiteral("读取目录失败：%1").arg(error));
+            return;
+        }
+
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(body, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+            failFolderDownload(QStringLiteral("服务器返回的目录列表不是有效 JSON 对象"));
+            return;
+        }
+
+        const QJsonObject rootObject = document.object();
+        if (rootObject.contains(QStringLiteral("success"))
+            && !rootObject.value(QStringLiteral("success")).toBool()) {
+            failFolderDownload(rootObject.value(QStringLiteral("message")).toString(
+                QStringLiteral("服务器未能返回目录列表")));
+            return;
+        }
+
+        QJsonObject listObject = rootObject;
+        if (rootObject.value(QStringLiteral("data")).isObject())
+            listObject = rootObject.value(QStringLiteral("data")).toObject();
+
+        QJsonArray entries;
+        bool hasList = false;
+        if (listObject.value(QStringLiteral("items")).isArray()) {
+            entries = listObject.value(QStringLiteral("items")).toArray();
+            hasList = true;
+        } else {
+            // 兼容旧接口；旧 directories 数组未必显式带有 kind 字段。
+            if (listObject.value(QStringLiteral("directories")).isArray()) {
+                const QJsonArray directories = listObject.value(
+                    QStringLiteral("directories")).toArray();
+                for (const QJsonValue &value : directories) {
+                    if (!value.isObject())
+                        continue;
+                    QJsonObject object = value.toObject();
+                    object.insert(QStringLiteral("kind"), QStringLiteral("folder"));
+                    entries.append(object);
+                }
+                hasList = true;
+            }
+            if (listObject.value(QStringLiteral("files")).isArray()) {
+                const QJsonArray files = listObject.value(QStringLiteral("files")).toArray();
+                for (const QJsonValue &value : files) {
+                    if (!value.isObject())
+                        continue;
+                    QJsonObject object = value.toObject();
+                    object.insert(QStringLiteral("kind"), QStringLiteral("file"));
+                    entries.append(object);
+                }
+                hasList = true;
+            }
+        }
+        if (!hasList) {
+            failFolderDownload(QStringLiteral("目录列表响应缺少 items 或 files/directories 数组"));
+            return;
+        }
+
+        const QString directoryPrefix = requestedDirectory.isEmpty()
+            ? QString() : requestedDirectory + QLatin1Char('/');
+        const QString rootPrefix = m_folderCloudPath + QLatin1Char('/');
+        for (const QJsonValue &value : entries) {
+            if (!value.isObject())
+                continue;
+
+            QJsonObject object = value.toObject();
+            QString name = object.value(QStringLiteral("name")).toString();
+            QString itemPath = object.value(QStringLiteral("path")).toString();
+            if (name.isEmpty() && !itemPath.isEmpty())
+                name = QFileInfo(itemPath).fileName();
+            if (name.isEmpty())
+                continue;
+            if (itemPath.isEmpty()) {
+                itemPath = requestedDirectory.isEmpty()
+                    ? name : requestedDirectory + QLatin1Char('/') + name;
+            }
+            object.insert(QStringLiteral("name"), name);
+            object.insert(QStringLiteral("path"), itemPath);
+
+            const QVariantMap item = makeFileItem(object);
+            QString childPath;
+            if (!normalizeCloudPath(item.value(QStringLiteral("path")).toString(),
+                                    &childPath) || childPath.isEmpty()) {
+                failFolderDownload(QStringLiteral("服务器返回了无效的子项路径"));
+                return;
+            }
+
+            // 当前接口应只返回直接子项，拒绝伪造的父目录或跨目录路径。
+            if ((!directoryPrefix.isEmpty() && !childPath.startsWith(directoryPrefix))
+                || !childPath.startsWith(rootPrefix)) {
+                failFolderDownload(QStringLiteral("服务器返回了超出下载范围的子项路径"));
+                return;
+            }
+            const QString directName = directoryPrefix.isEmpty()
+                ? childPath : childPath.mid(directoryPrefix.size());
+            if (directName.isEmpty() || directName.contains(QLatin1Char('/'))) {
+                failFolderDownload(QStringLiteral("服务器返回的子项不是当前目录的直接子项"));
+                return;
+            }
+
+            const QString relativePath = childPath.mid(rootPrefix.size());
+            if (relativePath.isEmpty()) {
+                failFolderDownload(QStringLiteral("服务器返回了无效的本地相对路径"));
+                return;
+            }
+            const QString localPath = QDir(m_folderLocalRoot).filePath(relativePath);
+            const bool isDirectory = item.value(QStringLiteral("kind")).toString()
+                                     == QStringLiteral("folder");
+            if (isDirectory) {
+                if (m_folderKnownDirectories.contains(childPath))
+                    continue;
+                if (!QDir().mkpath(localPath)) {
+                    failFolderDownload(QStringLiteral("无法创建本地子目录：%1")
+                                           .arg(relativePath));
+                    return;
+                }
+                m_folderKnownDirectories.insert(childPath);
+                m_folderPendingDirectories.enqueue(childPath);
+            } else {
+                if (m_folderKnownFiles.contains(childPath))
+                    continue;
+                if (!QDir().mkpath(QFileInfo(localPath).absolutePath())) {
+                    failFolderDownload(QStringLiteral("无法创建文件保存目录：%1")
+                                           .arg(relativePath));
+                    return;
+                }
+                m_folderKnownFiles.insert(childPath);
+                m_folderFileQueue.enqueue(FolderFileTask{childPath, localPath});
+                ++m_folderTotalFiles;
+            }
+        }
+
+        processNextFolderDirectory();
+    });
+}
+
+void UploadManager::downloadNextFolderFile()
+{
+    if (!m_folderDownloadActive || m_shuttingDown)
+        return;
+    if (m_folderFileQueue.isEmpty()) {
+        finishFolderDownload();
+        return;
+    }
+
+    const FolderFileTask task = m_folderFileQueue.dequeue();
+    setListStatus(QStringLiteral("正在下载文件夹：%1/%2 个文件")
+                      .arg(m_folderCompletedFiles + 1)
+                      .arg(m_folderTotalFiles));
+    startFileDownload(task.cloudPath, QUrl::fromLocalFile(task.localPath));
+}
+
+void UploadManager::finishFolderDownload()
+{
+    const QString cloudPath = m_folderCloudPath;
+    const QString localPath = m_folderLocalRoot;
+    const int fileCount = m_folderTotalFiles;
+    resetFolderDownload();
+    m_folderDownloadActive = false;
+    setDownloading(false);
+    setListStatus(QStringLiteral("文件夹下载完成：%1（%2 个文件）")
+                      .arg(localPath)
+                      .arg(fileCount));
+    emit folderDownloaded(cloudPath, localPath);
+}
+
+void UploadManager::failFolderDownload(const QString &reason)
+{
+    const QString cloudPath = m_folderCloudPath;
+    const QString localRoot = m_folderLocalRoot;
+    resetDownload();
+    resetFolderDownload();
+    m_folderDownloadActive = false;
+    setDownloading(false);
+
+    // 本地根目录由本次任务新建，失败时可安全清理，不会触碰用户已有目录。
+    if (!localRoot.isEmpty() && !QDir(localRoot).removeRecursively()) {
+        qWarning().noquote() << QStringLiteral("无法完整清理失败的文件夹下载目录：%1")
+                                    .arg(localRoot);
+    }
+    setListStatus(QStringLiteral("文件夹下载失败：%1").arg(reason));
+    emit folderDownloadFailed(cloudPath, reason);
+}
+
+void UploadManager::resetFolderDownload()
+{
+    if (m_folderListReply) {
+        QNetworkReply *reply = m_folderListReply;
+        m_folderListReply = nullptr;
+        disconnect(reply, nullptr, this, nullptr);
+        reply->abort();
+        reply->deleteLater();
+    }
+    m_folderPendingDirectories.clear();
+    m_folderFileQueue.clear();
+    m_folderKnownDirectories.clear();
+    m_folderKnownFiles.clear();
+    m_folderCloudPath.clear();
+    m_folderLocalRoot.clear();
+    m_folderTotalFiles = 0;
+    m_folderCompletedFiles = 0;
 }
 
 QString UploadManager::fileContentUrl(const QString &path) const
@@ -1585,6 +2352,22 @@ void UploadManager::setCreatingFolder(bool value)
         return;
     m_creatingFolder = value;
     emit creatingFolderChanged();
+}
+
+void UploadManager::setOpeningFile(bool value)
+{
+    if (m_openingFile == value)
+        return;
+    m_openingFile = value;
+    emit openingFileChanged();
+}
+
+void UploadManager::setDownloading(bool value)
+{
+    if (m_downloading == value)
+        return;
+    m_downloading = value;
+    emit downloadingChanged();
 }
 
 void UploadManager::setProgress(int value)

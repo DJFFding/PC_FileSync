@@ -1,8 +1,10 @@
 #pragma once
 
 #include <QObject>
+#include <QList>
 #include <QNetworkAccessManager>
 #include <QQueue>
+#include <QSet>
 #include <QStringList>
 #include <QTimer>
 #include <QVariantList>
@@ -10,6 +12,7 @@
 
 class QNetworkReply;
 class QProcess;
+class QSaveFile;
 class QTemporaryDir;
 class QTemporaryFile;
 class QUrl;
@@ -35,6 +38,8 @@ class UploadManager final : public QObject
     Q_PROPERTY(bool uploading READ uploading NOTIFY uploadingChanged)
     Q_PROPERTY(bool loadingFiles READ loadingFiles NOTIFY loadingFilesChanged)
     Q_PROPERTY(bool creatingFolder READ creatingFolder NOTIFY creatingFolderChanged)
+    Q_PROPERTY(bool openingFile READ openingFile NOTIFY openingFileChanged)
+    Q_PROPERTY(bool downloading READ downloading NOTIFY downloadingChanged)
     Q_PROPERTY(int progress READ progress NOTIFY progressChanged)
     Q_PROPERTY(QString currentFile READ currentFile NOTIFY currentFileChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
@@ -67,6 +72,8 @@ public:
     bool uploading() const;
     bool loadingFiles() const;
     bool creatingFolder() const;
+    bool openingFile() const;
+    bool downloading() const;
     int progress() const;
     QString currentFile() const;
     QString statusText() const;
@@ -95,6 +102,21 @@ public:
     // 在当前文件列表接口同级创建 /folders 请求，在当前目录新建一个文件夹。
     Q_INVOKABLE void createFolder(const QString &folderName);
 
+    // 打开文件：远端文件先流式下载到临时目录，再交给系统默认程序打开。
+    // 临时文件由本类持有，应用退出前不会被清理，避免外部程序读到不存在的路径。
+    Q_INVOKABLE void openFile(const QString &path);
+
+    // 下载文件：destination 接收 QtQuick.Dialogs FileDialog.selectedFile。
+    // 使用 QSaveFile 原子写入，失败时不会留下不完整的下载文件。
+    Q_INVOKABLE void downloadFile(const QString &path, const QUrl &destination);
+
+    // 下载文件夹：destination 接收 QtQuick.Dialogs FolderDialog.selectedFolder。
+    // 在所选目录下新建同名文件夹，递归保留子目录及空目录，不覆盖已有同名目录。
+    Q_INVOKABLE void downloadFolder(const QString &path, const QUrl &destination);
+
+    // 为保存对话框提供“系统下载目录 + 原文件名”的默认位置。
+    Q_INVOKABLE QUrl defaultDownloadUrl(const QString &path) const;
+
     // 将列表中的相对路径转换为可供 QML Image 使用的文件内容 URL。
     Q_INVOKABLE QString fileContentUrl(const QString &path) const;
 
@@ -120,6 +142,8 @@ signals:
     void uploadingChanged();
     void loadingFilesChanged();
     void creatingFolderChanged();
+    void openingFileChanged();
+    void downloadingChanged();
     void progressChanged();
     void currentFileChanged();
     void statusTextChanged();
@@ -146,6 +170,13 @@ signals:
                        const QString &modifiedText);
     void folderCreationFailed(const QString &folderName, const QString &reason);
 
+    void fileOpened(const QString &path, const QString &localPath);
+    void fileOpenFailed(const QString &path, const QString &reason);
+    void fileDownloaded(const QString &path, const QString &localPath);
+    void fileDownloadFailed(const QString &path, const QString &reason);
+    void folderDownloaded(const QString &path, const QString &localPath);
+    void folderDownloadFailed(const QString &path, const QString &reason);
+
     // DOCX 转换成功后同样发出此信号，QML 无需维护第二套文档视图。
     void pdfPreviewReady(int requestId, const QString &localUrl, int pageCount);
     void documentPreviewFailed(int requestId, const QString &reason);
@@ -164,8 +195,27 @@ private:
         qint64 size = 0;
     };
 
+    struct FolderFileTask
+    {
+        QString cloudPath;
+        QString localPath;
+    };
+
     void uploadNext();
     void finishCurrentTask(bool success, const QString &reason = QString());
+
+    void finishOpenFile();
+    void failFileOpen(const QString &reason);
+    void resetOpenFile();
+    void startFileDownload(const QString &path, const QUrl &destination);
+    void finishDownload();
+    void failDownload(const QString &reason);
+    void resetDownload();
+    void processNextFolderDirectory();
+    void downloadNextFolderFile();
+    void finishFolderDownload();
+    void failFolderDownload(const QString &reason);
+    void resetFolderDownload();
 
     void resetDocumentPreparation();
     void prepareLocalDocument(int requestId, const QUrl &sourceUrl);
@@ -186,6 +236,8 @@ private:
     void setUploading(bool value);
     void setLoadingFiles(bool value);
     void setCreatingFolder(bool value);
+    void setOpeningFile(bool value);
+    void setDownloading(bool value);
     void setProgress(int value);
     void setCurrentFile(const QString &value);
     void setStatusText(const QString &value);
@@ -211,6 +263,25 @@ private:
     QNetworkReply *m_listReply = nullptr;
     QNetworkReply *m_folderReply = nullptr;
     QNetworkReply *m_documentReply = nullptr;
+    QNetworkReply *m_openReply = nullptr;
+    QNetworkReply *m_downloadReply = nullptr;
+    QNetworkReply *m_folderListReply = nullptr;
+    QTemporaryFile *m_openFile = nullptr;
+    QSaveFile *m_downloadFile = nullptr;
+    // 已交给外部程序打开的文件需要保留到应用退出，不能下载完成后立即删除。
+    QList<QTemporaryFile *> m_openedFiles;
+    QString m_openCloudPath;
+    QString m_downloadCloudPath;
+    QString m_downloadLocalPath;
+    QQueue<QString> m_folderPendingDirectories;
+    QQueue<FolderFileTask> m_folderFileQueue;
+    QSet<QString> m_folderKnownDirectories;
+    QSet<QString> m_folderKnownFiles;
+    QString m_folderCloudPath;
+    QString m_folderLocalRoot;
+    int m_folderTotalFiles = 0;
+    int m_folderCompletedFiles = 0;
+    bool m_folderDownloadActive = false;
     QTemporaryFile *m_documentFile = nullptr;
     QProcess *m_documentConverter = nullptr;
     // 保存 DOCX 转换输入、独立 LibreOffice 配置及输出 PDF，关闭预览前不能删除。
@@ -242,6 +313,8 @@ private:
     bool m_uploading = false;
     bool m_loadingFiles = false;
     bool m_creatingFolder = false;
+    bool m_openingFile = false;
+    bool m_downloading = false;
     int m_progress = 0;
     int m_completedCount = 0;
     int m_totalCount = 0;

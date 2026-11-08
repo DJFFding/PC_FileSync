@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import FileSyncComponents 1.0
 
@@ -11,7 +12,7 @@ import FileSyncComponents 1.0
  *
  * 文件列表使用本地 ListModel；上传、列表和预览通过 C++ UploadManager 接入 HTTP 服务。
  * 服务器文件变化通过 WebSocket 主动推送，客户端自动刷新当前目录并在断线后重连。
- * 下载、分享、删除、刷新和立即同步仍通过 signals 暴露给业务层。
+ * 行菜单的打开和下载由 UploadManager 完成；分享、删除、刷新和立即同步仍通过 signals 暴露给业务层。
  */
 Item {
     id: root
@@ -91,6 +92,35 @@ Item {
 
     function openFolder(path) {
         uploadManager.openFolder(path === undefined || path === null ? "" : path.toString())
+    }
+
+    // 自定义模型未提供 path 时，按当前云端目录和文件名构造相对路径。
+    function cloudItemPath(path, name) {
+        if (path !== undefined && path !== null && path.toString().length > 0)
+            return path.toString()
+        var itemName = name === undefined || name === null ? "" : name.toString()
+        return uploadManager.currentPath.length > 0
+               ? uploadManager.currentPath + "/" + itemName : itemName
+    }
+
+    function requestDownload(path, kind) {
+        var sourcePath = path === undefined || path === null ? "" : path.toString()
+        if (sourcePath.length === 0 || uploadManager.downloading)
+            return
+
+        if (kind === "folder") {
+            downloadFolderDialog.cloudPath = sourcePath
+            downloadFolderDialog.open()
+            return
+        }
+
+        downloadFileDialog.cloudPath = sourcePath
+        downloadFileDialog.currentFile = uploadManager.defaultDownloadUrl(sourcePath)
+        downloadFileDialog.open()
+    }
+
+    function showDownloadResult(succeeded, isFolder, localPath, reason) {
+        downloadResultDialog.showResult(succeeded, isFolder, localPath, reason)
     }
 
     function clearSelection() {
@@ -1296,6 +1326,7 @@ Item {
                                                     root.selectFile(name, kind, modified, size, status, ext)
                                                     rowMenu.fileName = name
                                                     rowMenu.fileKind = kind
+                                                    rowMenu.filePath = root.cloudItemPath(fileRow.filePath, name)
                                                     rowMenu.popup(rowMenuButton,
                                                                   rowMenuButton.width - rowMenu.width,
                                                                   rowMenuButton.height + 6)
@@ -1901,13 +1932,14 @@ Item {
     }
 
     // ============================================================
-    // 文件行“更多操作”菜单：当前仅定义 UI，不连接菜单业务操作。
+    // 文件行“更多操作”菜单：打开和下载直接使用当前行的云端相对路径。
     // ============================================================
     Menu {
         id: rowMenu
 
         property string fileName: ""
         property string fileKind: ""
+        property string filePath: ""
 
         width: 220
         padding: 6
@@ -1993,7 +2025,9 @@ Item {
 
         MenuItem {
             id: openMenuItem
-            text: rowMenu.fileKind === "folder" ? "打开文件夹" : "打开文件"
+            text: rowMenu.fileKind === "folder" ? "打开文件夹"
+                  : (uploadManager.openingFile ? "正在打开…" : "打开文件")
+            enabled: rowMenu.fileKind === "folder" || !uploadManager.openingFile
             implicitHeight: 40
             hoverEnabled: true
             leftPadding: 6
@@ -2033,11 +2067,21 @@ Item {
                     elide: Text.ElideRight
                 }
             }
+
+            onTriggered: {
+                if (rowMenu.filePath.length === 0)
+                    return
+                if (rowMenu.fileKind === "folder")
+                    root.openFolder(rowMenu.filePath)
+                else
+                    uploadManager.openFile(rowMenu.filePath)
+            }
         }
 
         MenuItem {
             id: downloadMenuItem
-            text: "下载到本地"
+            text: uploadManager.downloading ? "正在下载…" : "下载到本地"
+            enabled: !uploadManager.downloading
             implicitHeight: 40
             hoverEnabled: true
             leftPadding: 6
@@ -2077,6 +2121,8 @@ Item {
                     elide: Text.ElideRight
                 }
             }
+
+            onTriggered: root.requestDownload(rowMenu.filePath, rowMenu.fileKind)
         }
 
         MenuItem {
@@ -2619,6 +2665,43 @@ Item {
         }
     }
 
+    // 下载结果提示：成功时展示最终保存路径，失败时展示具体原因。
+    DownloadResultDialog {
+        id: downloadResultDialog
+    }
+
+    // 文件夹下载选择目标父目录，实际保存目录由 UploadManager 新建并自动避免重名。
+    FolderDialog {
+        id: downloadFolderDialog
+        title: "选择文件夹保存位置"
+
+        property string cloudPath: ""
+
+        onAccepted: {
+            var sourcePath = cloudPath
+            cloudPath = ""
+            uploadManager.downloadFolder(sourcePath, selectedFolder)
+        }
+        onRejected: cloudPath = ""
+    }
+
+    // 单文件下载保存对话框：只在用户确认目标路径后启动网络请求。
+    FileDialog {
+        id: downloadFileDialog
+        title: "下载到本地"
+        fileMode: FileDialog.SaveFile
+        nameFilters: ["所有文件 (*)"]
+
+        property string cloudPath: ""
+
+        onAccepted: {
+            var sourcePath = cloudPath
+            cloudPath = ""
+            uploadManager.downloadFile(sourcePath, selectedFile)
+        }
+        onRejected: cloudPath = ""
+    }
+
     // 上传交互独立封装，页面只负责打开弹窗和维护文件列表。
     UploadDialog {
         id: uploadDialog
@@ -2703,6 +2786,22 @@ Item {
         function onUploadFinished(successCount, failedCount) {
             if (successCount > 0 && !uploadManager.webSocketConnected)
                 uploadManager.loadFiles()
+        }
+
+        function onFileDownloaded(path, localPath) {
+            root.showDownloadResult(true, false, localPath, "")
+        }
+
+        function onFolderDownloaded(path, localPath) {
+            root.showDownloadResult(true, true, localPath, "")
+        }
+
+        function onFileDownloadFailed(path, reason) {
+            root.showDownloadResult(false, false, "", reason)
+        }
+
+        function onFolderDownloadFailed(path, reason) {
+            root.showDownloadResult(false, true, "", reason)
         }
 
         function onFilesLoadFailed(reason) {

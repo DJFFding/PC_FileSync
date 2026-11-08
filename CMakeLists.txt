@@ -177,6 +177,7 @@ qt_add_qml_module(FileSyncComponents
         qml/components/WindowButton.qml
         qml/components/UploadDialog.qml
         qml/components/FilePreviewDialog.qml
+        qml/components/DownloadResultDialog.qml
     RESOURCES
         assets/eye-off.svg
         assets/eye.svg
