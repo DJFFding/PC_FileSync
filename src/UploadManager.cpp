@@ -389,6 +389,7 @@ UploadManager::UploadManager(QObject *parent)
     m_reconnectTimer.setSingleShot(true);
     m_refreshTimer.setSingleShot(true);
     m_favoritesRefreshTimer.setSingleShot(true);
+    m_trashRefreshTimer.setSingleShot(true);
     m_handshakeTimer.setSingleShot(true);
     m_handshakeTimer.setInterval(15000);
     m_pingTimer.setInterval(30000);
@@ -399,6 +400,8 @@ UploadManager::UploadManager(QObject *parent)
             this, &UploadManager::loadFiles);
     connect(&m_favoritesRefreshTimer, &QTimer::timeout,
             this, &UploadManager::loadFavorites);
+    connect(&m_trashRefreshTimer, &QTimer::timeout,
+            this, &UploadManager::loadTrash);
     connect(&m_handshakeTimer, &QTimer::timeout, this, [this]() {
         if (m_eventSocket.state() == QAbstractSocket::ConnectingState) {
             setWebSocketStatus(QStringLiteral("实时同步连接超时，正在重试…"));
@@ -422,6 +425,7 @@ UploadManager::UploadManager(QObject *parent)
         // 断线期间可能错过事件，每次建立连接都进行一次全量对账。
         scheduleFilesRefresh(0);
         scheduleFavoritesRefresh(0);
+        scheduleTrashRefresh(0);
     });
     connect(&m_eventSocket, &QWebSocket::disconnected, this, [this]() {
         m_handshakeTimer.stop();
@@ -457,6 +461,7 @@ UploadManager::~UploadManager()
     m_reconnectTimer.stop();
     m_refreshTimer.stop();
     m_favoritesRefreshTimer.stop();
+    m_trashRefreshTimer.stop();
     m_pingTimer.stop();
     m_handshakeTimer.stop();
     m_eventSocket.abort();
@@ -495,6 +500,13 @@ UploadManager::~UploadManager()
         reply->abort();
         reply->deleteLater();
     }
+    if (m_trashActionReply) {
+        QNetworkReply *reply = m_trashActionReply;
+        m_trashActionReply = nullptr;
+        disconnect(reply, nullptr, this, nullptr);
+        reply->abort();
+        reply->deleteLater();
+    }
     if (m_folderChoicesReply) {
         QNetworkReply *reply = m_folderChoicesReply;
         m_folderChoicesReply = nullptr;
@@ -524,6 +536,7 @@ bool UploadManager::loadingFavorites() const { return m_loadingFavorites; }
 bool UploadManager::updatingFavorite() const { return m_updatingFavorite; }
 bool UploadManager::deleting() const { return m_deleting; }
 bool UploadManager::loadingTrash() const { return m_loadingTrash; }
+bool UploadManager::updatingTrash() const { return m_updatingTrash; }
 int UploadManager::progress() const { return m_progress; }
 QString UploadManager::currentFile() const { return m_currentFile; }
 QString UploadManager::statusText() const { return m_statusText; }
@@ -680,6 +693,13 @@ void UploadManager::scheduleFavoritesRefresh(int delayMs)
     m_favoritesRefreshTimer.start(qMax(0, delayMs));
 }
 
+void UploadManager::scheduleTrashRefresh(int delayMs)
+{
+    if (m_shuttingDown || m_trashRefreshTimer.isActive())
+        return;
+    m_trashRefreshTimer.start(qMax(0, delayMs));
+}
+
 bool UploadManager::eventAffectsCurrentPath(const QStringList &paths) const
 {
     if (paths.isEmpty() || m_currentPath.isEmpty())
@@ -718,7 +738,8 @@ void UploadManager::handleWebSocketMessage(const QString &message)
     }
     const bool isFilesChanged = type == QStringLiteral("filesChanged");
     const bool isFavoritesChanged = type == QStringLiteral("favoritesChanged");
-    if (!isFilesChanged && !isFavoritesChanged)
+    const bool isTrashChanged = type == QStringLiteral("trashChanged");
+    if (!isFilesChanged && !isFavoritesChanged && !isTrashChanged)
         return;
     if (revision > 0 && revision <= m_lastEventRevision)
         return;
@@ -726,6 +747,10 @@ void UploadManager::handleWebSocketMessage(const QString &message)
 
     if (isFavoritesChanged) {
         scheduleFavoritesRefresh();
+        return;
+    }
+    if (isTrashChanged) {
+        scheduleTrashRefresh();
         return;
     }
 
@@ -1726,6 +1751,8 @@ void UploadManager::deleteItem(const QString &path)
 
 void UploadManager::loadTrash()
 {
+    // 主动刷新取代已计划的刷新，避免操作成功信号与 WebSocket 事件造成重复请求。
+    m_trashRefreshTimer.stop();
     // 回收站刷新以最后一次请求为准，避免旧响应覆盖新数据。
     if (m_trashListReply) {
         QNetworkReply *oldReply = m_trashListReply;
@@ -1824,6 +1851,184 @@ void UploadManager::loadTrash()
 
         setLoadingTrash(false);
         emit trashLoaded(items);
+    });
+}
+
+void UploadManager::restoreTrashItem(const QString &trashId)
+{
+    startTrashAction(TrashAction::Restore, trashId);
+}
+
+void UploadManager::permanentlyDeleteTrashItem(const QString &trashId)
+{
+    startTrashAction(TrashAction::PermanentDelete, trashId);
+}
+
+void UploadManager::emptyTrash()
+{
+    startTrashAction(TrashAction::Empty);
+}
+
+void UploadManager::failTrashAction(TrashAction action,
+                                    const QString &trashId,
+                                    const QString &reason)
+{
+    setUpdatingTrash(false);
+    switch (action) {
+    case TrashAction::Restore:
+        setListStatus(QStringLiteral("还原失败：%1").arg(reason));
+        emit trashItemRestoreFailed(trashId, reason);
+        break;
+    case TrashAction::PermanentDelete:
+        setListStatus(QStringLiteral("彻底删除失败：%1").arg(reason));
+        emit trashPermanentDeleteFailed(trashId, reason);
+        break;
+    case TrashAction::Empty:
+        setListStatus(QStringLiteral("清空回收站失败：%1").arg(reason));
+        emit trashEmptyFailed(reason);
+        break;
+    }
+}
+
+void UploadManager::startTrashAction(TrashAction action, const QString &trashId)
+{
+    const QString requestedId = trashId.trimmed();
+    if (m_updatingTrash) {
+        failTrashAction(action, requestedId,
+                        QStringLiteral("另一个回收站操作尚未完成，请稍后再试"));
+        return;
+    }
+
+    if (action != TrashAction::Empty
+        && (requestedId.isEmpty() || requestedId.size() > 128
+            || requestedId == QStringLiteral(".") || requestedId == QStringLiteral("..")
+            || requestedId.contains(QLatin1Char('/'))
+            || requestedId.contains(QLatin1Char('\\'))
+            || requestedId.contains(QLatin1Char('\0')))) {
+        failTrashAction(action, requestedId, QStringLiteral("回收站条目 ID 无效或不安全"));
+        return;
+    }
+
+    QUrl endpoint(m_fileListUrl);
+    if (!endpoint.isValid()
+        || (endpoint.scheme() != QStringLiteral("http")
+            && endpoint.scheme() != QStringLiteral("https"))) {
+        failTrashAction(action, requestedId,
+                        QStringLiteral("文件服务地址无效：请填写 http 或 https 地址"));
+        return;
+    }
+
+    QString basePath = endpoint.path();
+    const int lastSlash = basePath.lastIndexOf(QLatin1Char('/'));
+    basePath = lastSlash >= 0 ? basePath.left(lastSlash + 1) : QStringLiteral("/");
+
+    QString actionPath;
+    QString pendingText;
+    QJsonObject payload;
+    switch (action) {
+    case TrashAction::Restore:
+        actionPath = QStringLiteral("trash/restore");
+        pendingText = QStringLiteral("正在还原回收站项目…");
+        payload.insert(QStringLiteral("path"), requestedId);
+        break;
+    case TrashAction::PermanentDelete:
+        actionPath = QStringLiteral("trash/delete");
+        pendingText = QStringLiteral("正在彻底删除回收站项目…");
+        payload.insert(QStringLiteral("path"), requestedId);
+        break;
+    case TrashAction::Empty:
+        actionPath = QStringLiteral("trash/empty");
+        pendingText = QStringLiteral("正在清空回收站…");
+        break;
+    }
+
+    endpoint.setPath(basePath + actionPath);
+    endpoint.setQuery(QUrlQuery());
+    endpoint.setFragment(QString());
+
+    QNetworkRequest request(endpoint);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setRawHeader(QByteArrayLiteral("Content-Type"),
+                         QByteArrayLiteral("application/json; charset=utf-8"));
+    // 大文件夹还原或清空可能需要跨磁盘复制、递归清理。
+    request.setTransferTimeout(120000);
+
+    setUpdatingTrash(true);
+    setListStatus(pendingText);
+    QNetworkReply *reply = m_network.post(
+        request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
+    m_trashActionReply = reply;
+
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, action, requestedId]() {
+        if (reply != m_trashActionReply) {
+            reply->deleteLater();
+            return;
+        }
+
+        m_trashActionReply = nullptr;
+        const QByteArray responseBody = reply->readAll();
+        const int httpStatus = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString networkError = reply->errorString();
+        const bool hasNetworkError = reply->error() != QNetworkReply::NoError;
+        reply->deleteLater();
+
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(responseBody, &parseError);
+        const bool hasJsonObject = parseError.error == QJsonParseError::NoError
+                                   && document.isObject();
+        const QJsonObject responseObject = hasJsonObject ? document.object() : QJsonObject();
+        const QString serverMessage = responseObject.value(QStringLiteral("message")).toString();
+
+        QString error;
+        if (hasNetworkError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = serverMessage.isEmpty() ? networkError : serverMessage;
+            if (error.trimmed().isEmpty())
+                error = QStringLiteral("服务器返回异常响应");
+            if (serverMessage.isEmpty() && httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        } else if (!responseBody.isEmpty() && !hasJsonObject) {
+            error = QStringLiteral("服务器返回的回收站操作结果不是有效 JSON 对象");
+        } else if (responseObject.contains(QStringLiteral("success"))
+                   && !responseObject.value(QStringLiteral("success")).toBool()) {
+            error = serverMessage.isEmpty()
+                ? QStringLiteral("服务器未能完成回收站操作") : serverMessage;
+        }
+
+        if (!error.isEmpty()) {
+            failTrashAction(action, requestedId, error);
+            return;
+        }
+
+        setUpdatingTrash(false);
+        switch (action) {
+        case TrashAction::Restore: {
+            QString originalPath = responseObject.value(QStringLiteral("originalPath")).toString();
+            if (originalPath.isEmpty())
+                originalPath = responseObject.value(QStringLiteral("path")).toString();
+            QString normalizedPath;
+            if (!normalizeCloudPath(originalPath, &normalizedPath) || normalizedPath.isEmpty())
+                normalizedPath.clear();
+            setListStatus(normalizedPath.isEmpty()
+                ? QStringLiteral("回收站项目已还原")
+                : QStringLiteral("已还原到“%1”").arg(normalizedPath));
+            emit trashItemRestored(requestedId, normalizedPath);
+            break;
+        }
+        case TrashAction::PermanentDelete:
+            setListStatus(QStringLiteral("回收站项目已彻底删除"));
+            emit trashItemPermanentlyDeleted(requestedId);
+            break;
+        case TrashAction::Empty: {
+            const int deletedCount = qMax(0, responseObject.value(
+                QStringLiteral("deletedCount")).toInt());
+            setListStatus(QStringLiteral("回收站已清空，共删除 %1 个项目").arg(deletedCount));
+            emit trashEmptied(deletedCount);
+            break;
+        }
+        }
     });
 }
 
@@ -3418,6 +3623,14 @@ void UploadManager::setLoadingTrash(bool value)
         return;
     m_loadingTrash = value;
     emit loadingTrashChanged();
+}
+
+void UploadManager::setUpdatingTrash(bool value)
+{
+    if (m_updatingTrash == value)
+        return;
+    m_updatingTrash = value;
+    emit updatingTrashChanged();
 }
 
 void UploadManager::setProgress(int value)

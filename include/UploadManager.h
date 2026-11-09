@@ -26,6 +26,10 @@ class QUrl;
  * 移动协议：POST /move，JSON 请求体为 { "path": "原云端路径", "destinationPath": "目标文件夹" }。
  * 删除协议：POST /trash，JSON 请求体为 { "path": "云端路径" }，文件或整个文件夹由服务端移入回收站。
  * 回收站协议：GET /trash，返回真实回收站条目；path 是回收站 ID，originalPath 是原云端路径。
+ * 还原协议：POST /trash/restore，JSON 请求体为 { "path": "回收站 ID" }。
+ * 彻底删除协议：POST /trash/delete，JSON 请求体为 { "path": "回收站 ID" }。
+ * 清空回收站协议：POST /trash/empty，JSON 请求体为 {}。
+ * 服务器会永久清理删除满 30 天的条目，并通过 trashChanged 事件通知客户端。
  * 目录选择协议：GET /folders?path=目录，只返回该目录的直接子文件夹，供移动弹窗逐级浏览。
  * 文件列表协议：GET /files?path=目录，返回当前层 items，以及递归文件统计。
  * 仍兼容仅返回 items 数组，或 files + directories 数组的服务。
@@ -54,6 +58,7 @@ class UploadManager final : public QObject
     Q_PROPERTY(bool updatingFavorite READ updatingFavorite NOTIFY updatingFavoriteChanged)
     Q_PROPERTY(bool deleting READ deleting NOTIFY deletingChanged)
     Q_PROPERTY(bool loadingTrash READ loadingTrash NOTIFY loadingTrashChanged)
+    Q_PROPERTY(bool updatingTrash READ updatingTrash NOTIFY updatingTrashChanged)
     Q_PROPERTY(int progress READ progress NOTIFY progressChanged)
     Q_PROPERTY(QString currentFile READ currentFile NOTIFY currentFileChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
@@ -95,6 +100,7 @@ public:
     bool updatingFavorite() const;
     bool deleting() const;
     bool loadingTrash() const;
+    bool updatingTrash() const;
     int progress() const;
     QString currentFile() const;
     QString statusText() const;
@@ -141,6 +147,15 @@ public:
 
     // 加载真实回收站条目，path 是回收站 ID，originalPath 记录原云端路径。
     Q_INVOKABLE void loadTrash();
+
+    // 还原到原云端路径；同名项目已存在时服务器拒绝操作，不覆盖任何内容。
+    Q_INVOKABLE void restoreTrashItem(const QString &trashId);
+
+    // 永久删除单个回收站条目，文件或整个文件夹都会被删除且不可恢复。
+    Q_INVOKABLE void permanentlyDeleteTrashItem(const QString &trashId);
+
+    // 永久删除回收站中的全部条目。
+    Q_INVOKABLE void emptyTrash();
 
     // 移动弹窗使用：加载指定云端目录的直接子文件夹，不改变主界面的 currentPath。
     Q_INVOKABLE void loadFolderChoices(const QString &folderPath);
@@ -194,6 +209,7 @@ signals:
     void updatingFavoriteChanged();
     void deletingChanged();
     void loadingTrashChanged();
+    void updatingTrashChanged();
     void progressChanged();
     void currentFileChanged();
     void statusTextChanged();
@@ -216,6 +232,12 @@ signals:
     void favoritesLoadFailed(const QString &reason);
     void trashLoaded(const QVariantList &items);
     void trashLoadFailed(const QString &reason);
+    void trashItemRestored(const QString &trashId, const QString &originalPath);
+    void trashItemRestoreFailed(const QString &trashId, const QString &reason);
+    void trashItemPermanentlyDeleted(const QString &trashId);
+    void trashPermanentDeleteFailed(const QString &trashId, const QString &reason);
+    void trashEmptied(int deletedCount);
+    void trashEmptyFailed(const QString &reason);
     void favoriteAdded(const QString &path, int addedCount, int favoriteCount);
     void favoriteAddFailed(const QString &path, const QString &reason);
     void favoriteRemoved(const QString &path, int removedCount, int favoriteCount);
@@ -261,6 +283,12 @@ signals:
     void uploadFinished(int successCount, int failedCount);
 
 private:
+    enum class TrashAction {
+        Restore,
+        PermanentDelete,
+        Empty
+    };
+
     struct UploadTask
     {
         QString path;
@@ -277,6 +305,8 @@ private:
     void uploadNext();
     void finishCurrentTask(bool success, const QString &reason = QString());
     void setFavorite(const QString &path, bool favorite);
+    void startTrashAction(TrashAction action, const QString &trashId = QString());
+    void failTrashAction(TrashAction action, const QString &trashId, const QString &reason);
 
     void finishOpenFile();
     void failFileOpen(const QString &reason);
@@ -305,6 +335,7 @@ private:
     bool eventAffectsCurrentPath(const QStringList &paths) const;
     void scheduleFilesRefresh(int delayMs = 250);
     void scheduleFavoritesRefresh(int delayMs = 250);
+    void scheduleTrashRefresh(int delayMs = 250);
     void setWebSocketConnected(bool value);
     void setWebSocketStatus(const QString &value);
 
@@ -320,6 +351,7 @@ private:
     void setUpdatingFavorite(bool value);
     void setDeleting(bool value);
     void setLoadingTrash(bool value);
+    void setUpdatingTrash(bool value);
     void setProgress(int value);
     void setCurrentFile(const QString &value);
     void setStatusText(const QString &value);
@@ -339,6 +371,7 @@ private:
     QTimer m_reconnectTimer;
     QTimer m_refreshTimer;
     QTimer m_favoritesRefreshTimer;
+    QTimer m_trashRefreshTimer;
     QTimer m_pingTimer;
     QTimer m_handshakeTimer;
     QQueue<UploadTask> m_queue;
@@ -356,6 +389,7 @@ private:
     QNetworkReply *m_favoriteListReply = nullptr;
     QNetworkReply *m_deleteReply = nullptr;
     QNetworkReply *m_trashListReply = nullptr;
+    QNetworkReply *m_trashActionReply = nullptr;
     QTemporaryFile *m_openFile = nullptr;
     QSaveFile *m_downloadFile = nullptr;
     // 已交给外部程序打开的文件需要保留到应用退出，不能下载完成后立即删除。
@@ -412,6 +446,7 @@ private:
     bool m_updatingFavorite = false;
     bool m_deleting = false;
     bool m_loadingTrash = false;
+    bool m_updatingTrash = false;
     int m_progress = 0;
     int m_completedCount = 0;
     int m_totalCount = 0;

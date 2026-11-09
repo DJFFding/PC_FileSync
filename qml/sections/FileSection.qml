@@ -14,6 +14,7 @@ import FileSyncComponents 1.0
  * 服务器文件变化通过 WebSocket 主动推送，客户端自动刷新当前目录并在断线后重连。
  * 行菜单的打开、下载、重命名、移动、收藏和删除由 UploadManager 完成；分享、刷新和立即同步仍通过 signals 暴露给业务层。
  * 删除文件或文件夹时由服务器将整个项目移入回收站，文件夹的全部后代和空目录都会保留。
+ * 回收站条目保留 30 天；还原、彻底删除和清空均由 UploadManager 调用服务器完成。
  * 收藏文件夹时由服务器递归登记其全部后代，收藏页展示真实持久化数据。
  */
 Item {
@@ -58,7 +59,7 @@ Item {
     property var trashModelSource: trashModel
     property string trashFilter: "全部"
     property string trashSearchKeyword: ""
-    property bool trashLoading: uploadManager.loadingTrash
+    property bool trashLoading: uploadManager.loadingTrash || uploadManager.updatingTrash
     property int trashRetentionDays: 30
     property string selectedTrashPath: ""
     property bool detailsVisible: true
@@ -91,7 +92,7 @@ Item {
     signal navigationChanged(string navigation)
     signal fileSelected(string fileName, string fileKind)
     signal favoriteRemovalRequested(string fileName, string filePath)
-    // 回收站刷新由 UploadManager 完成；还原、彻底删除和清空仍保留给后续业务操作。
+    // 回收站刷新、还原、彻底删除和清空均由 UploadManager 完成。
     signal trashRefreshRequested()
     signal trashRestoreRequested(string fileName, string filePath)
     signal trashPermanentDeleteRequested(string fileName, string filePath)
@@ -104,6 +105,18 @@ Item {
     onDeleteRequested: root.requestDelete(root.selectedPath, fileName, root.selectedKind)
     onFavoriteRemovalRequested:(fileName,filePath)=>uploadManager.removeFavorite(filePath)
     onTrashRefreshRequested: uploadManager.loadTrash()
+    onTrashRestoreRequested: {
+        if (!uploadManager.updatingTrash)
+            uploadManager.restoreTrashItem(filePath)
+    }
+    onTrashPermanentDeleteRequested: {
+        if (!uploadManager.updatingTrash)
+            uploadManager.permanentlyDeleteTrashItem(filePath)
+    }
+    onTrashEmptyRequested: {
+        if (!uploadManager.updatingTrash)
+            uploadManager.emptyTrash()
+    }
     onCurrentNavChanged: {
         if (currentNav === "收藏夹")
             uploadManager.loadFavorites()
@@ -2392,7 +2405,7 @@ Item {
                     }
 
                     // ====================================================
-                    // 回收站：独立页面，操作请求交由业务层处理并刷新数据源。
+                    // 回收站：独立页面，操作请求交由 UploadManager 处理并刷新数据源。
                     // ====================================================
                     ColumnLayout {
                         id: trashPage
@@ -4092,6 +4105,7 @@ Item {
                         Layout.preferredWidth: 94
                         Layout.preferredHeight: 34
                         hoverEnabled: true
+                        enabled: !root.trashLoading
                         background: Rectangle {
                             radius: 8
                             color: confirmTrashActionButton.down ? "#BD514D"
@@ -5203,8 +5217,51 @@ Item {
                 favoriteResultDialog.showResult(false, "加载回收站失败：" + reason)
         }
 
+        function onTrashItemRestored(trashId, originalPath) {
+            root.selectedTrashPath = ""
+            uploadManager.loadTrash()
+            uploadManager.loadFiles()
+            uploadManager.loadFavorites()
+            favoriteResultDialog.showResult(true, originalPath.length > 0
+                ? "已还原到原位置：" + originalPath
+                : "回收站项目已还原。")
+        }
+
+        function onTrashItemRestoreFailed(trashId, reason) {
+            // 响应丢失或跨卷移动异常时，服务器可能已经产生部分实际变化。
+            uploadManager.loadTrash()
+            uploadManager.loadFiles()
+            favoriteResultDialog.showResult(false, "还原失败：" + reason)
+        }
+
+        function onTrashItemPermanentlyDeleted(trashId) {
+            root.selectedTrashPath = ""
+            uploadManager.loadTrash()
+            favoriteResultDialog.showResult(true, "项目已彻底删除。")
+        }
+
+        function onTrashPermanentDeleteFailed(trashId, reason) {
+            uploadManager.loadTrash()
+            favoriteResultDialog.showResult(false, "彻底删除失败：" + reason)
+        }
+
+        function onTrashEmptied(deletedCount) {
+            root.selectedTrashPath = ""
+            uploadManager.loadTrash()
+            favoriteResultDialog.showResult(true, deletedCount > 0
+                ? "回收站已清空，共彻底删除 " + deletedCount + " 个项目。"
+                : "回收站已经是空的。")
+        }
+
+        function onTrashEmptyFailed(reason) {
+            // 清空可能只失败了一部分，以服务器重新返回的列表为准。
+            root.selectedTrashPath = ""
+            uploadManager.loadTrash()
+            favoriteResultDialog.showResult(false, "清空回收站失败：" + reason)
+        }
+
         function onServerFilesChanged(paths, revision) {
-            // 其他客户端删除内容时，正在查看的回收站也保持同步。
+            // 其他客户端删除或还原内容时，正在查看的回收站也保持同步。
             if (root.currentNav === "回收站")
                 uploadManager.loadTrash()
         }

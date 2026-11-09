@@ -69,6 +69,194 @@ QString displayFavoriteTime(const QString &storedValue)
         : storedValue;
 }
 
+// 下列辅助函数会在回收站条目校验与还原目录重建中使用。
+bool cleanCloudPath(const QString &requestedPath, QString *cleanPath, QString *error);
+Qt::CaseSensitivity fileSystemCaseSensitivity();
+
+constexpr int kTrashRetentionDays = 30;
+
+QDateTime parseStoredDateTime(const QString &storedValue)
+{
+    const QDateTime withMilliseconds = QDateTime::fromString(storedValue, Qt::ISODateWithMs);
+    return withMilliseconds.isValid()
+        ? withMilliseconds : QDateTime::fromString(storedValue, Qt::ISODate);
+}
+
+bool isValidTrashId(const QString &trashId)
+{
+    return !trashId.isEmpty() && trashId.size() <= 128
+           && trashId != QStringLiteral(".") && trashId != QStringLiteral("..")
+           && !trashId.contains(QLatin1Char('/'))
+           && !trashId.contains(QLatin1Char('\\'))
+           && !trashId.contains(QLatin1Char('\0'));
+}
+
+struct TrashEntry
+{
+    QString trashId;
+    QString entryAbsolutePath;
+    QString payloadAbsolutePath;
+    QString originalPath;
+    QString originalParentPath;
+    QString name;
+    QString deletedAt;
+    QDateTime deletedDateTime;
+    QFileInfo payloadInfo;
+};
+
+// 所有回收站操作都通过此函数读取条目，统一限制 ID、元数据和 payload 的位置及类型。
+bool readTrashEntry(const QDir &trashRoot,
+                    const QString &trashId,
+                    TrashEntry *entry,
+                    QString *error)
+{
+    if (!isValidTrashId(trashId)) {
+        *error = QStringLiteral("回收站条目 ID 无效或不安全");
+        return false;
+    }
+
+    const QFileInfo entryInfo(trashRoot.filePath(trashId));
+    if (!entryInfo.exists() || !entryInfo.isDir() || entryInfo.isSymLink()) {
+        *error = QStringLiteral("回收站条目不存在或不可访问");
+        return false;
+    }
+
+    const QString canonicalRoot = QDir::fromNativeSeparators(trashRoot.canonicalPath());
+    const QString canonicalEntry = QDir::fromNativeSeparators(entryInfo.canonicalFilePath());
+    if (canonicalRoot.isEmpty() || canonicalEntry.isEmpty()
+        || QDir(canonicalRoot).relativeFilePath(canonicalEntry) != trashId) {
+        *error = QStringLiteral("回收站条目不在允许的存储目录中");
+        return false;
+    }
+
+    const QDir entryDir(entryInfo.absoluteFilePath());
+    const QFileInfo metadataInfo(entryDir.filePath(QStringLiteral("info.json")));
+    if (!metadataInfo.exists() || !metadataInfo.isFile() || metadataInfo.isSymLink()) {
+        *error = QStringLiteral("回收站条目的元数据不存在或不可访问");
+        return false;
+    }
+
+    QFile metadataFile(metadataInfo.absoluteFilePath());
+    if (!metadataFile.open(QIODevice::ReadOnly)) {
+        *error = QStringLiteral("无法读取回收站条目的元数据");
+        return false;
+    }
+
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(
+        metadataFile.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        *error = QStringLiteral("回收站条目的元数据格式无效");
+        return false;
+    }
+
+    const QJsonObject metadata = document.object();
+    QString originalPath;
+    QString pathError;
+    if (!cleanCloudPath(metadata.value(QStringLiteral("originalPath")).toString(),
+                        &originalPath, &pathError) || originalPath.isEmpty()) {
+        *error = QStringLiteral("回收站条目记录的原路径无效");
+        return false;
+    }
+
+    const QFileInfo payloadInfo(entryDir.filePath(QStringLiteral("payload")));
+    if (!payloadInfo.exists() || payloadInfo.isSymLink()
+        || (!payloadInfo.isFile() && !payloadInfo.isDir())) {
+        *error = QStringLiteral("回收站条目的内容不存在或不可访问");
+        return false;
+    }
+
+    QString name = metadata.value(QStringLiteral("name")).toString();
+    if (name.isEmpty())
+        name = QFileInfo(originalPath).fileName();
+    if (name.isEmpty()) {
+        *error = QStringLiteral("回收站条目记录的名称为空");
+        return false;
+    }
+
+    const int pathSeparator = originalPath.lastIndexOf(QLatin1Char('/'));
+    entry->trashId = trashId;
+    entry->entryAbsolutePath = entryInfo.absoluteFilePath();
+    entry->payloadAbsolutePath = payloadInfo.absoluteFilePath();
+    entry->originalPath = originalPath;
+    entry->originalParentPath = pathSeparator >= 0
+        ? originalPath.left(pathSeparator) : QString();
+    entry->name = name;
+    entry->deletedAt = metadata.value(QStringLiteral("deletedAt")).toString(
+        metadata.value(QStringLiteral("deletedTime")).toString());
+    entry->deletedDateTime = parseStoredDateTime(entry->deletedAt);
+    entry->payloadInfo = payloadInfo;
+    return true;
+}
+
+bool removeTrashEntryAtPath(const QString &absolutePath, QString *error)
+{
+    const QFileInfo info(absolutePath);
+    if (!info.exists() && !info.isSymLink())
+        return true;
+
+    bool removed = false;
+    if (info.isSymLink() || !info.isDir())
+        removed = QFile::remove(absolutePath);
+    else
+        removed = QDir(absolutePath).removeRecursively();
+
+    if (!removed)
+        *error = QStringLiteral("无法删除回收站条目，请检查文件是否被占用及目录权限");
+    return removed;
+}
+
+// 还原时按需逐级重建原父目录；每一级都拒绝符号链接并确认仍位于上传根目录内。
+bool ensureCloudDirectory(const QDir &rootDir,
+                          const QString &requestedPath,
+                          QDir *directory,
+                          QString *relativePath,
+                          QString *error)
+{
+    QString cleaned;
+    if (!cleanCloudPath(requestedPath, &cleaned, error))
+        return false;
+
+    const QString canonicalRoot = QDir::fromNativeSeparators(rootDir.canonicalPath());
+    if (canonicalRoot.isEmpty()) {
+        *error = QStringLiteral("文件存储目录不可用");
+        return false;
+    }
+    const QString rootPrefix = canonicalRoot.endsWith(QLatin1Char('/'))
+        ? canonicalRoot : canonicalRoot + QLatin1Char('/');
+
+    QDir current(canonicalRoot);
+    const QStringList segments = cleaned.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    for (const QString &segment : segments) {
+        const QString nextPath = current.filePath(segment);
+        const QFileInfo nextInfo(nextPath);
+        if (nextInfo.exists() || nextInfo.isSymLink()) {
+            if (nextInfo.isSymLink() || !nextInfo.isDir()) {
+                *error = QStringLiteral("原位置包含同名文件或不安全的目录，无法还原");
+                return false;
+            }
+        } else if (!current.mkdir(segment)) {
+            *error = QStringLiteral("无法重建原文件夹，请检查目录写入权限");
+            return false;
+        }
+
+        const QFileInfo resolvedInfo(nextPath);
+        const QString canonicalNext = QDir::fromNativeSeparators(
+            resolvedInfo.canonicalFilePath());
+        if (!resolvedInfo.exists() || !resolvedInfo.isDir() || resolvedInfo.isSymLink()
+            || canonicalNext.isEmpty()
+            || !canonicalNext.startsWith(rootPrefix, fileSystemCaseSensitivity())) {
+            *error = QStringLiteral("原位置目录不安全，无法还原");
+            return false;
+        }
+        current = QDir(canonicalNext);
+    }
+
+    *directory = current;
+    *relativePath = cleaned;
+    return true;
+}
+
 // 将客户端传入的云端相对路径限制在上传根目录内。空字符串和 "." 均表示根目录。
 bool cleanCloudPath(const QString &requestedPath, QString *cleanPath, QString *error)
 {
@@ -589,6 +777,17 @@ LocalUploadServer::LocalUploadServer(QObject *parent)
     m_changeTimer.setInterval(250);
     connect(&m_changeTimer, &QTimer::timeout,
             this, &LocalUploadServer::broadcastFileChanges);
+
+    // 运行期间每小时检查一次；启动和读取回收站时也会检查，避免长期不打开页面而残留到期内容。
+    m_trashCleanupTimer.setInterval(60 * 60 * 1000);
+    connect(&m_trashCleanupTimer, &QTimer::timeout, this, [this]() {
+        QString cleanupError;
+        purgeExpiredTrash(&cleanupError);
+        if (!cleanupError.isEmpty()) {
+            qWarning().noquote() << QStringLiteral("自动清理到期回收站条目失败：%1")
+                                        .arg(cleanupError);
+        }
+    });
 }
 
 bool LocalUploadServer::listen(quint16 port, quint16 eventPort)
@@ -638,6 +837,14 @@ bool LocalUploadServer::listen(quint16 port, quint16 eventPort)
     loadFavorites();
     rebuildFileSystemWatch();
     synchronizeFavorites();
+
+    QString cleanupError;
+    purgeExpiredTrash(&cleanupError);
+    if (!cleanupError.isEmpty()) {
+        qWarning().noquote() << QStringLiteral("启动时清理到期回收站条目失败：%1")
+                                    .arg(cleanupError);
+    }
+    m_trashCleanupTimer.start();
 
     qInfo().noquote() << QStringLiteral("FileSync 本地测试服务已启动：")
                       << QStringLiteral("http://127.0.0.1:%1/upload")
@@ -1036,6 +1243,70 @@ void LocalUploadServer::broadcastFavoritesChanged(const QString &cloudPath)
     }
 }
 
+void LocalUploadServer::broadcastTrashChanged()
+{
+    if (!m_eventServer.isListening())
+        return;
+
+    const QJsonObject event{
+        {QStringLiteral("type"), QStringLiteral("trashChanged")},
+        {QStringLiteral("revision"), static_cast<double>(++m_revision)},
+        {QStringLiteral("retentionDays"), kTrashRetentionDays},
+        {QStringLiteral("timestamp"),
+         QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}
+    };
+    const QString message = QString::fromUtf8(
+        QJsonDocument(event).toJson(QJsonDocument::Compact));
+    for (QWebSocket *socket : std::as_const(m_eventClients)) {
+        if (socket && socket->state() == QAbstractSocket::ConnectedState)
+            socket->sendTextMessage(message);
+    }
+}
+
+int LocalUploadServer::purgeExpiredTrash(QString *error)
+{
+    int removedCount = 0;
+    QString firstError;
+    const QDir trashRoot(trashFilesPath());
+    if (!trashRoot.exists())
+        return 0;
+
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QFileInfoList entries = trashRoot.entryInfoList(
+        QDir::Dirs | QDir::NoDotAndDotDot, QDir::NoSort);
+    for (const QFileInfo &entryInfo : entries) {
+        if (entryInfo.isSymLink())
+            continue;
+
+        TrashEntry entry;
+        QString entryError;
+        if (!readTrashEntry(trashRoot, entryInfo.fileName(), &entry, &entryError))
+            continue; // 损坏记录不属于可确认到期的数据，保留并等待人工处理。
+
+        if (!entry.deletedDateTime.isValid()
+            || entry.deletedDateTime.addDays(kTrashRetentionDays) > now) {
+            continue;
+        }
+
+        if (!removeTrashEntryAtPath(entry.entryAbsolutePath, &entryError)) {
+            if (firstError.isEmpty())
+                firstError = QStringLiteral("%1：%2").arg(entry.trashId, entryError);
+            continue;
+        }
+
+        ++removedCount;
+        qInfo().noquote() << QStringLiteral("回收站条目已满 %1 天并自动清理：%2（原路径：%3）")
+                                 .arg(kTrashRetentionDays)
+                                 .arg(entry.trashId, entry.originalPath);
+    }
+
+    if (removedCount > 0)
+        broadcastTrashChanged();
+    if (error)
+        *error = firstError;
+    return removedCount;
+}
+
 void LocalUploadServer::rebuildFileSystemWatch()
 {
     QDir rootDir(m_storageRoot);
@@ -1212,16 +1483,24 @@ void LocalUploadServer::readRequest(QTcpSocket *socket)
                                && requestPath == QStringLiteral("/move");
     const bool isMoveToTrashRequest = method == QByteArrayLiteral("POST")
                                       && requestPath == QStringLiteral("/trash");
+    const bool isRestoreTrashRequest = method == QByteArrayLiteral("POST")
+                                       && requestPath == QStringLiteral("/trash/restore");
+    const bool isPermanentDeleteTrashRequest = method == QByteArrayLiteral("POST")
+                                               && requestPath == QStringLiteral("/trash/delete");
+    const bool isEmptyTrashRequest = method == QByteArrayLiteral("POST")
+                                     && requestPath == QStringLiteral("/trash/empty");
     const bool isAddFavoriteRequest = method == QByteArrayLiteral("POST")
                                       && requestPath == QStringLiteral("/favorites");
     const bool isRemoveFavoriteRequest = method == QByteArrayLiteral("POST")
                                          && requestPath == QStringLiteral("/favorites/remove");
     if (!isUploadRequest && !isCreateFolderRequest && !isRenameRequest && !isMoveRequest
-        && !isMoveToTrashRequest && !isAddFavoriteRequest && !isRemoveFavoriteRequest) {
+        && !isMoveToTrashRequest && !isRestoreTrashRequest
+        && !isPermanentDeleteTrashRequest && !isEmptyTrashRequest
+        && !isAddFavoriteRequest && !isRemoveFavoriteRequest) {
         sendJson(socket, 404, QByteArrayLiteral("Not Found"),
                  QJsonDocument(QJsonObject{
                      {QStringLiteral("success"), false},
-                     {QStringLiteral("message"), QStringLiteral("接口不存在，请使用 GET /files、GET /folders、GET /favorites、GET /trash、GET /file、POST /upload、POST /folders、POST /rename、POST /move、POST /trash、POST /favorites 或 POST /favorites/remove")}
+                     {QStringLiteral("message"), QStringLiteral("接口不存在，请使用 GET /files、GET /folders、GET /favorites、GET /trash、GET /file、POST /upload、POST /folders、POST /rename、POST /move、POST /trash、POST /trash/restore、POST /trash/delete、POST /trash/empty、POST /favorites 或 POST /favorites/remove")}
                  }).toJson(QJsonDocument::Compact));
         return;
     }
@@ -1251,6 +1530,7 @@ void LocalUploadServer::readRequest(QTcpSocket *socket)
         return;
     }
     if ((isCreateFolderRequest || isRenameRequest || isMoveRequest || isMoveToTrashRequest
+         || isRestoreTrashRequest || isPermanentDeleteTrashRequest || isEmptyTrashRequest
          || isAddFavoriteRequest || isRemoveFavoriteRequest)
         && contentLength > 64 * 1024) {
         sendJson(socket, 413, QByteArrayLiteral("Payload Too Large"),
@@ -1281,6 +1561,18 @@ void LocalUploadServer::readRequest(QTcpSocket *socket)
     }
     if (isMoveToTrashRequest) {
         processMoveToTrashRequest(socket, body);
+        return;
+    }
+    if (isRestoreTrashRequest) {
+        processRestoreTrashRequest(socket, body);
+        return;
+    }
+    if (isPermanentDeleteTrashRequest) {
+        processPermanentDeleteTrashRequest(socket, body);
+        return;
+    }
+    if (isEmptyTrashRequest) {
+        processEmptyTrashRequest(socket, body);
         return;
     }
     if (isAddFavoriteRequest) {
@@ -2113,6 +2405,13 @@ void LocalUploadServer::processMoveRequest(QTcpSocket *socket, const QByteArray 
 
 void LocalUploadServer::processTrashRequest(QTcpSocket *socket)
 {
+    QString cleanupError;
+    const int expiredItemsRemoved = purgeExpiredTrash(&cleanupError);
+    if (!cleanupError.isEmpty()) {
+        qWarning().noquote() << QStringLiteral("读取回收站前清理到期条目失败：%1")
+                                    .arg(cleanupError);
+    }
+
     QList<QJsonObject> trashItems;
     const QDir trashRoot(trashFilesPath());
     if (trashRoot.exists()) {
@@ -2185,6 +2484,10 @@ void LocalUploadServer::processTrashRequest(QTcpSocket *socket)
             const QString deletedAt = metadata.value(QStringLiteral("deletedAt")).toString(
                 metadata.value(QStringLiteral("deletedTime")).toString());
             const QString deletedTime = displayFavoriteTime(deletedAt);
+            const QDateTime deletedDateTime = parseStoredDateTime(deletedAt);
+            const QString expiresAt = deletedDateTime.isValid()
+                ? deletedDateTime.addDays(kTrashRetentionDays).toString(Qt::ISODateWithMs)
+                : QString();
 
             trashItems.append(QJsonObject{
                 {QStringLiteral("id"), trashId},
@@ -2199,6 +2502,8 @@ void LocalUploadServer::processTrashRequest(QTcpSocket *socket)
                 {QStringLiteral("modified"), deletedTime},
                 {QStringLiteral("deletedAt"), deletedAt},
                 {QStringLiteral("deletedTime"), deletedTime},
+                {QStringLiteral("expiresAt"), expiresAt},
+                {QStringLiteral("retentionDays"), kTrashRetentionDays},
                 {QStringLiteral("size"), sizeText},
                 {QStringLiteral("fileCount"), fileCount},
                 {QStringLiteral("status"), QStringLiteral("已删除")},
@@ -2225,11 +2530,15 @@ void LocalUploadServer::processTrashRequest(QTcpSocket *socket)
     for (const QJsonObject &item : std::as_const(trashItems))
         items.append(item);
 
-    const QJsonObject responseObject{
+    QJsonObject responseObject{
         {QStringLiteral("success"), true},
         {QStringLiteral("totalItems"), items.size()},
+        {QStringLiteral("retentionDays"), kTrashRetentionDays},
+        {QStringLiteral("expiredItemsRemoved"), expiredItemsRemoved},
         {QStringLiteral("items"), items}
     };
+    if (!cleanupError.isEmpty())
+        responseObject.insert(QStringLiteral("cleanupError"), cleanupError);
     sendJson(socket, 200, QByteArrayLiteral("OK"),
              QJsonDocument(responseObject).toJson(QJsonDocument::Compact));
 }
@@ -2396,6 +2705,7 @@ void LocalUploadServer::processMoveToTrashRequest(QTcpSocket *socket, const QByt
     qInfo().noquote() << QStringLiteral("已移入回收站：%1 -> %2")
                              .arg(sourceAbsolutePath, payloadAbsolutePath);
     queueFileChange(sourcePath);
+    broadcastTrashChanged();
 
     const QJsonObject responseObject{
         {QStringLiteral("success"), true},
@@ -2410,6 +2720,237 @@ void LocalUploadServer::processMoveToTrashRequest(QTcpSocket *socket, const QByt
              ? QStringLiteral("folder") : QStringLiteral("file")},
         {QStringLiteral("deletedAt"), deletedAt},
         {QStringLiteral("deletedTime"), displayFavoriteTime(deletedAt)}
+    };
+    sendJson(socket, 200, QByteArrayLiteral("OK"),
+             QJsonDocument(responseObject).toJson(QJsonDocument::Compact));
+}
+
+void LocalUploadServer::processRestoreTrashRequest(QTcpSocket *socket,
+                                                   const QByteArray &body)
+{
+    auto sendError = [this, socket](int statusCode, const QByteArray &reason,
+                                    const QString &message) {
+        sendJson(socket, statusCode, reason,
+                 QJsonDocument(QJsonObject{
+                     {QStringLiteral("success"), false},
+                     {QStringLiteral("message"), message}
+                 }).toJson(QJsonDocument::Compact));
+    };
+
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(body, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        sendError(400, QByteArrayLiteral("Bad Request"),
+                  QStringLiteral("请求体不是有效的 JSON 对象"));
+        return;
+    }
+
+    const QJsonObject requestObject = document.object();
+    QString trashId = requestObject.value(QStringLiteral("path")).toString().trimmed();
+    if (trashId.isEmpty())
+        trashId = requestObject.value(QStringLiteral("trashId")).toString().trimmed();
+    if (trashId.isEmpty())
+        trashId = requestObject.value(QStringLiteral("id")).toString().trimmed();
+    if (trashId.isEmpty()) {
+        sendError(400, QByteArrayLiteral("Bad Request"),
+                  QStringLiteral("缺少要还原的回收站条目 ID"));
+        return;
+    }
+
+    // 到期条目即使尚未到定时检查时间，也不能再通过手动还原绕过保留期限。
+    QString cleanupError;
+    purgeExpiredTrash(&cleanupError);
+    if (!cleanupError.isEmpty()) {
+        qWarning().noquote() << QStringLiteral("还原前清理到期回收站条目失败：%1")
+                                    .arg(cleanupError);
+    }
+
+    TrashEntry entry;
+    QString entryError;
+    const QDir trashRoot(trashFilesPath());
+    if (!readTrashEntry(trashRoot, trashId, &entry, &entryError)) {
+        sendError(404, QByteArrayLiteral("Not Found"), entryError);
+        return;
+    }
+
+    QDir rootDir(uploadedFilesPath());
+    if (!rootDir.exists()) {
+        QDir appDir(QCoreApplication::applicationDirPath());
+        if (!appDir.mkpath(QStringLiteral("uploaded_files"))) {
+            sendError(500, QByteArrayLiteral("Internal Server Error"),
+                      QStringLiteral("无法创建文件存储目录"));
+            return;
+        }
+        rootDir = QDir(uploadedFilesPath());
+    }
+
+    QDir restoredParentDir;
+    QString restoredParentPath;
+    if (!ensureCloudDirectory(rootDir, entry.originalParentPath,
+                              &restoredParentDir, &restoredParentPath, &entryError)) {
+        sendError(409, QByteArrayLiteral("Conflict"), entryError);
+        return;
+    }
+
+    const QString itemName = QFileInfo(entry.originalPath).fileName();
+    if (itemName.isEmpty()) {
+        sendError(500, QByteArrayLiteral("Internal Server Error"),
+                  QStringLiteral("回收站条目记录的原文件名无效"));
+        return;
+    }
+
+    const QString targetAbsolutePath = restoredParentDir.filePath(itemName);
+    const QFileInfo targetInfo(targetAbsolutePath);
+    if (targetInfo.exists() || targetInfo.isSymLink()) {
+        sendError(409, QByteArrayLiteral("Conflict"),
+                  QStringLiteral("原位置已存在同名文件或文件夹，未覆盖任何内容"));
+        return;
+    }
+
+    QString moveError;
+    if (!moveFileOrDirectory(entry.payloadAbsolutePath, targetAbsolutePath, &moveError)) {
+        if (QFileInfo::exists(targetAbsolutePath)) {
+            synchronizeItemOrder();
+            queueFileChange(entry.originalPath);
+        }
+        sendError(500, QByteArrayLiteral("Internal Server Error"), moveError);
+        return;
+    }
+
+    // payload 已安全移走，剩余目录只应包含元数据；清理失败不影响已完成的还原结果。
+    if (!QDir(entry.entryAbsolutePath).removeRecursively()) {
+        qWarning().noquote() << QStringLiteral("还原成功，但回收站元数据目录清理失败：%1")
+                                    .arg(entry.entryAbsolutePath);
+    }
+
+    registerItemOrder(entry.originalPath);
+    synchronizeItemOrder();
+    queueFileChange(entry.originalPath);
+    broadcastTrashChanged();
+
+    const QFileInfo restoredInfo(targetAbsolutePath);
+    qInfo().noquote() << QStringLiteral("回收站项目已还原：%1 -> %2")
+                             .arg(entry.payloadAbsolutePath, targetAbsolutePath);
+    const QJsonObject responseObject{
+        {QStringLiteral("success"), true},
+        {QStringLiteral("message"), QStringLiteral("已还原到原位置")},
+        {QStringLiteral("trashId"), trashId},
+        {QStringLiteral("id"), trashId},
+        {QStringLiteral("originalPath"), entry.originalPath},
+        {QStringLiteral("path"), entry.originalPath},
+        {QStringLiteral("destinationPath"), restoredParentPath},
+        {QStringLiteral("name"), entry.name},
+        {QStringLiteral("kind"), restoredInfo.isDir()
+             ? QStringLiteral("folder") : QStringLiteral("file")}
+    };
+    sendJson(socket, 200, QByteArrayLiteral("OK"),
+             QJsonDocument(responseObject).toJson(QJsonDocument::Compact));
+}
+
+void LocalUploadServer::processPermanentDeleteTrashRequest(QTcpSocket *socket,
+                                                           const QByteArray &body)
+{
+    auto sendError = [this, socket](int statusCode, const QByteArray &reason,
+                                    const QString &message) {
+        sendJson(socket, statusCode, reason,
+                 QJsonDocument(QJsonObject{
+                     {QStringLiteral("success"), false},
+                     {QStringLiteral("message"), message}
+                 }).toJson(QJsonDocument::Compact));
+    };
+
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(body, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        sendError(400, QByteArrayLiteral("Bad Request"),
+                  QStringLiteral("请求体不是有效的 JSON 对象"));
+        return;
+    }
+
+    const QJsonObject requestObject = document.object();
+    QString trashId = requestObject.value(QStringLiteral("path")).toString().trimmed();
+    if (trashId.isEmpty())
+        trashId = requestObject.value(QStringLiteral("trashId")).toString().trimmed();
+    if (trashId.isEmpty())
+        trashId = requestObject.value(QStringLiteral("id")).toString().trimmed();
+    if (trashId.isEmpty()) {
+        sendError(400, QByteArrayLiteral("Bad Request"),
+                  QStringLiteral("缺少要彻底删除的回收站条目 ID"));
+        return;
+    }
+
+    TrashEntry entry;
+    QString entryError;
+    const QDir trashRoot(trashFilesPath());
+    if (!readTrashEntry(trashRoot, trashId, &entry, &entryError)) {
+        sendError(404, QByteArrayLiteral("Not Found"), entryError);
+        return;
+    }
+
+    if (!removeTrashEntryAtPath(entry.entryAbsolutePath, &entryError)) {
+        sendError(500, QByteArrayLiteral("Internal Server Error"), entryError);
+        return;
+    }
+
+    qInfo().noquote() << QStringLiteral("回收站项目已彻底删除：%1（原路径：%2）")
+                             .arg(trashId, entry.originalPath);
+    broadcastTrashChanged();
+    const QJsonObject responseObject{
+        {QStringLiteral("success"), true},
+        {QStringLiteral("message"), QStringLiteral("已彻底删除")},
+        {QStringLiteral("trashId"), trashId},
+        {QStringLiteral("id"), trashId},
+        {QStringLiteral("originalPath"), entry.originalPath},
+        {QStringLiteral("deletedCount"), 1}
+    };
+    sendJson(socket, 200, QByteArrayLiteral("OK"),
+             QJsonDocument(responseObject).toJson(QJsonDocument::Compact));
+}
+
+void LocalUploadServer::processEmptyTrashRequest(QTcpSocket *socket, const QByteArray &body)
+{
+    Q_UNUSED(body);
+
+    int deletedCount = 0;
+    int failedCount = 0;
+    QString firstError;
+    const QDir trashRoot(trashFilesPath());
+    if (trashRoot.exists()) {
+        const QFileInfoList entries = trashRoot.entryInfoList(
+            QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot, QDir::NoSort);
+        for (const QFileInfo &entryInfo : entries) {
+            QString removeError;
+            if (!removeTrashEntryAtPath(entryInfo.absoluteFilePath(), &removeError)) {
+                ++failedCount;
+                if (firstError.isEmpty())
+                    firstError = QStringLiteral("%1：%2").arg(entryInfo.fileName(), removeError);
+                continue;
+            }
+            ++deletedCount;
+        }
+    }
+
+    if (deletedCount > 0)
+        broadcastTrashChanged();
+
+    if (failedCount > 0) {
+        const QJsonObject responseObject{
+            {QStringLiteral("success"), false},
+            {QStringLiteral("message"), QStringLiteral("部分回收站内容无法删除：%1").arg(firstError)},
+            {QStringLiteral("deletedCount"), deletedCount},
+            {QStringLiteral("failedCount"), failedCount}
+        };
+        sendJson(socket, 500, QByteArrayLiteral("Internal Server Error"),
+                 QJsonDocument(responseObject).toJson(QJsonDocument::Compact));
+        return;
+    }
+
+    qInfo().noquote() << QStringLiteral("回收站已清空，共删除 %1 个条目").arg(deletedCount);
+    const QJsonObject responseObject{
+        {QStringLiteral("success"), true},
+        {QStringLiteral("message"), QStringLiteral("回收站已清空")},
+        {QStringLiteral("deletedCount"), deletedCount},
+        {QStringLiteral("failedCount"), 0}
     };
     sendJson(socket, 200, QByteArrayLiteral("OK"),
              QJsonDocument(responseObject).toJson(QJsonDocument::Compact));

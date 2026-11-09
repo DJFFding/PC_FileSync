@@ -28,9 +28,15 @@ class QWebSocket;
  *   GET  /files?path= 返回指定目录的直接子项，以及该目录的递归文件统计
  *   GET  /file?path=  返回指定文件内容，供 QML 图片/文本/文档预览使用
  *                      可选 offset/maxBytes 用于文本分块加载
+ *   GET  /trash       返回回收站条目；删除满 30 天的条目会在返回前自动清理
+ *   POST /trash       接收 JSON { "path": "云端路径" }，移入回收站
+ *   POST /trash/restore 接收 JSON { "path": "回收站 ID" }，还原到原位置
+ *   POST /trash/delete  接收 JSON { "path": "回收站 ID" }，彻底删除单个条目
+ *   POST /trash/empty   接收空 JSON 对象，清空回收站
  *
  * WebSocket 默认监听 127.0.0.1:8081/events，主动推送：
  *   { "type": "filesChanged", "revision": 1, "paths": ["dir/a.txt"] }
+ *   { "type": "trashChanged", "revision": 2 }
  * 服务器递归监听上传目录，因此直接修改服务器目录中的文件也会触发通知。
  *
  * 注意：此示例将上传请求体暂存在内存中，不适合直接用于生产环境或超大文件。
@@ -65,6 +71,10 @@ private:
     void synchronizeFavorites();
     void moveFavorites(const QString &oldCloudPath, const QString &newCloudPath);
     void broadcastFavoritesChanged(const QString &cloudPath);
+    void broadcastTrashChanged();
+
+    // 仅清理删除时间有效且已满 30 天的条目；损坏或缺少时间的记录会保留，避免误删。
+    int purgeExpiredTrash(QString *error = nullptr);
 
     void readRequest(QTcpSocket *socket);
     void processRequest(QTcpSocket *socket,
@@ -82,6 +92,9 @@ private:
     void processRemoveFavoriteRequest(QTcpSocket *socket, const QByteArray &body);
     void processTrashRequest(QTcpSocket *socket);
     void processMoveToTrashRequest(QTcpSocket *socket, const QByteArray &body);
+    void processRestoreTrashRequest(QTcpSocket *socket, const QByteArray &body);
+    void processPermanentDeleteTrashRequest(QTcpSocket *socket, const QByteArray &body);
+    void processEmptyTrashRequest(QTcpSocket *socket, const QByteArray &body);
     void sendJson(QTcpSocket *socket, int statusCode,
                   const QByteArray &reason,
                   const QByteArray &jsonBody);
@@ -93,6 +106,7 @@ private:
     QList<QWebSocket *> m_eventClients;
     QFileSystemWatcher m_fileWatcher;
     QTimer m_changeTimer;
+    QTimer m_trashCleanupTimer;
     QSet<QString> m_knownPaths;
     QSet<QString> m_pendingChanges;
     QHash<QString, quint64> m_itemOrder;
