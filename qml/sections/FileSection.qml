@@ -12,7 +12,8 @@ import FileSyncComponents 1.0
  *
  * 文件列表使用本地 ListModel；上传、列表和预览通过 C++ UploadManager 接入 HTTP 服务。
  * 服务器文件变化通过 WebSocket 主动推送，客户端自动刷新当前目录并在断线后重连。
- * 行菜单的打开、下载、重命名、移动和收藏由 UploadManager 完成；分享、删除、刷新和立即同步仍通过 signals 暴露给业务层。
+ * 行菜单的打开、下载、重命名、移动、收藏和删除由 UploadManager 完成；分享、刷新和立即同步仍通过 signals 暴露给业务层。
+ * 删除文件或文件夹时由服务器将整个项目移入回收站，文件夹的全部后代和空目录都会保留。
  * 收藏文件夹时由服务器递归登记其全部后代，收藏页展示真实持久化数据。
  */
 Item {
@@ -52,8 +53,17 @@ Item {
     property string favoriteSearchKeyword: ""
     // 默认使用 UploadManager 返回的真实收藏模型，也可由 C++ 替换为兼容模型。
     property var favoritesModelSource: favoritesModel
+    // 回收站使用独立状态和数据源，避免污染“我的文件”和“收藏夹”。
+    // 模型角色：name/kind/ext/size/iconBg/iconColor/path，另可提供 location/deletedTime。
+    property var trashModelSource: trashModel
+    property string trashFilter: "全部"
+    property string trashSearchKeyword: ""
+    property bool trashLoading: uploadManager.loadingTrash
+    property int trashRetentionDays: 30
+    property string selectedTrashPath: ""
     property bool detailsVisible: true
     property string selectedName: ""
+    property string selectedPath: ""
     property string selectedKind: ""
     property string selectedModified: ""
     property string selectedSize: ""
@@ -81,15 +91,24 @@ Item {
     signal navigationChanged(string navigation)
     signal fileSelected(string fileName, string fileKind)
     signal favoriteRemovalRequested(string fileName, string filePath)
+    // 回收站刷新由 UploadManager 完成；还原、彻底删除和清空仍保留给后续业务操作。
+    signal trashRefreshRequested()
+    signal trashRestoreRequested(string fileName, string filePath)
+    signal trashPermanentDeleteRequested(string fileName, string filePath)
+    signal trashEmptyRequested()
 
     // 两个上传按钮共用独立的上传面板；新建文件夹沿用同样的异步请求模式。
     onUploadRequested: uploadDialog.open()
     onCreateFolderRequested: uploadManager.createFolder(folderName)
     onRefreshRequested: uploadManager.loadFiles()
+    onDeleteRequested: root.requestDelete(root.selectedPath, fileName, root.selectedKind)
     onFavoriteRemovalRequested:(fileName,filePath)=>uploadManager.removeFavorite(filePath)
+    onTrashRefreshRequested: uploadManager.loadTrash()
     onCurrentNavChanged: {
         if (currentNav === "收藏夹")
             uploadManager.loadFavorites()
+        else if (currentNav === "回收站")
+            trashRefreshRequested()
     }
 
     function makeBreadcrumbs(path) {
@@ -121,6 +140,13 @@ Item {
                ? uploadManager.currentPath + "/" + itemName : itemName
     }
 
+    function requestDelete(path, name, kind) {
+        var sourcePath = cloudItemPath(path, name)
+        if (sourcePath.length === 0 || uploadManager.deleting)
+            return
+        deleteConfirmDialog.openFor(sourcePath, name, kind)
+    }
+
     function requestDownload(path, kind) {
         var sourcePath = path === undefined || path === null ? "" : path.toString()
         if (sourcePath.length === 0 || uploadManager.downloading)
@@ -143,15 +169,18 @@ Item {
 
     function clearSelection() {
         selectedName = ""
+        selectedPath = ""
         selectedKind = ""
         selectedModified = ""
         selectedSize = ""
         selectedStatus = ""
         selectedExt = ""
+        selectedTrashPath = ""
     }
 
-    function selectFile(name, kind, modified, size, status, ext) {
+    function selectFile(name, kind, modified, size, status, ext, path) {
         selectedName = name
+        selectedPath = cloudItemPath(path, name)
         selectedKind = kind
         selectedModified = modified
         selectedSize = size
@@ -183,6 +212,34 @@ Item {
     function matchesFavoriteSearch(name) {
         return favoriteSearchKeyword.length === 0
                || name.toLowerCase().indexOf(favoriteSearchKeyword.toLowerCase()) !== -1
+    }
+
+    function matchesTrashFilter(kind) {
+        if (trashFilter === "文件")
+            return kind !== "folder"
+        if (trashFilter === "文件夹")
+            return kind === "folder"
+        return true
+    }
+
+    function matchesTrashSearch(name) {
+        return trashSearchKeyword.length === 0
+               || name.toLowerCase().indexOf(trashSearchKeyword.toLowerCase()) !== -1
+    }
+
+    function trashItemPath(path, name) {
+        if (path !== undefined && path !== null && path.toString().length > 0)
+            return path.toString()
+        return name === undefined || name === null ? "" : name.toString()
+    }
+
+    // C++ 可直接替换 trashModelSource，也可在回收站请求完成后调用此函数填充本地模型。
+    function setTrashItems(items) {
+        trashModel.clear()
+        if (items === undefined || items === null)
+            return
+        for (var i = 0; i < items.length; ++i)
+            trashModel.append(items[i])
     }
 
     function removeFavorite(index, name, path) {
@@ -290,6 +347,74 @@ Item {
         return value.length > 0 ? value.toUpperCase() + " 文件" : "文件"
     }
 
+    // 文件、收藏和回收站共用的名称提示。
+    component ItemNameToolTip: ToolTip {
+        id: itemNameToolTip
+
+        property MouseArea mouseArea: null
+        property bool hoverAllowed: true
+
+        parent:  Overlay.overlay
+
+        // 将鼠标在 MouseArea 中的局部坐标转换为 Tooltip 父对象坐标
+        property point cursorPos: mouseArea
+                                   ? mouseArea.mapToItem(
+                                         itemNameToolTip.parent,
+                                         mouseArea.mouseX,
+                                         mouseArea.mouseY
+                                     )
+                                   : Qt.point(0, 0)
+
+        // 跟随鼠标，向右下偏移
+        x: cursorPos.x + 14
+        y: cursorPos.y + 20
+
+        delay: 800
+        timeout: -1
+
+        visible: mouseArea !== null
+                 && mouseArea.containsMouse
+                 && !mouseArea.pressed
+                 && hoverAllowed
+
+        modal: false
+        dim: false
+        focus: false
+        closePolicy: Popup.NoAutoClose
+
+        padding: 10
+        topPadding: 7
+        bottomPadding: 7
+
+        contentItem: Text {
+            id: itemNameToolTipText
+
+            text: itemNameToolTip.text
+
+            width: Math.max(
+                       1,
+                       Math.min(360, Math.ceil(itemNameToolTipMetrics.advanceWidth))
+                   )
+
+            color: root.textDarkColor
+            font.pixelSize: 11
+            font.weight: Font.Medium
+            wrapMode: Text.WrapAnywhere
+        }
+
+        background: Rectangle {
+            color: root.panelColor
+            border.color: "#DCE4F4"
+            border.width: 1
+            radius: 7
+        }
+
+        TextMetrics {
+            id: itemNameToolTipMetrics
+            font: itemNameToolTipText.font
+            text: itemNameToolTipText.text
+        }
+    }
     Rectangle {
         anchors.fill: parent
         color: root.pageColor
@@ -650,6 +775,7 @@ Item {
                 Item {
                     id: mainArea
                     width: workspace.width - (root.currentNav !== "收藏夹"
+                                              && root.currentNav !== "回收站"
                                               && root.detailsVisible && workspace.width >= 850 ? 270 : 0)
                     height: parent.height
 
@@ -662,7 +788,7 @@ Item {
                         anchors.fill: parent
                         anchors.margins: 22
                         spacing: 13
-                        visible: root.currentNav !== "收藏夹"
+                        visible: root.currentNav !== "收藏夹" && root.currentNav !== "回收站"
 
                         // 顶部标题、搜索和快捷操作
                         RowLayout {
@@ -1262,7 +1388,8 @@ Item {
                                             anchors.fill: parent
                                             hoverEnabled: true
                                             cursorShape: Qt.PointingHandCursor
-                                            onClicked: root.selectFile(name, kind, modified, size, status, ext)
+                                            onClicked: root.selectFile(name, kind, modified, size, status, ext,
+                                                                       fileRow.filePath)
                                             onDoubleClicked: {
                                                 if (kind === "folder") {
                                                     root.openFolder(fileRow.filePath)
@@ -1275,6 +1402,12 @@ Item {
                                                                       fileRow.serverPreviewType,
                                                                       ext, fileRow.serverMimeType)
                                             }
+                                        }
+
+                                        ItemNameToolTip {
+                                            mouseArea: rowMouse
+                                            text: name
+                                            hoverAllowed: !rowMenuButton.hovered && !copyTextButton.hovered
                                         }
 
                                         // 第一行：名称、修改时间、大小和同步状态。
@@ -1383,7 +1516,8 @@ Item {
                                                     verticalAlignment: Text.AlignVCenter
                                                 }
                                                 onClicked: {
-                                                    root.selectFile(name, kind, modified, size, status, ext)
+                                                    root.selectFile(name, kind, modified, size, status, ext,
+                                                                    fileRow.filePath)
                                                     rowMenu.fileName = name
                                                     rowMenu.fileKind = kind
                                                     rowMenu.filePath = root.cloudItemPath(fileRow.filePath, name)
@@ -2027,7 +2161,8 @@ Item {
                                                 anchors.fill: parent
                                                 hoverEnabled: true
                                                 cursorShape: Qt.PointingHandCursor
-                                                onClicked: root.selectFile(name, kind, modified, size, status, ext)
+                                                onClicked: root.selectFile(name, kind, modified, size, status, ext,
+                                                                           favoriteRow.filePath)
                                                 onDoubleClicked: {
                                                     if (kind === "folder") {
                                                         root.openFavoriteFolder(favoriteRow.filePath)
@@ -2037,6 +2172,12 @@ Item {
                                                                           favoriteRow.serverPreviewType,
                                                                           ext, favoriteRow.serverMimeType)
                                                 }
+                                            }
+
+                                            ItemNameToolTip {
+                                                mouseArea: favoriteRowMouse
+                                                text: name
+                                                hoverAllowed: !removeFavoriteButton.hovered
                                             }
 
                                             Row {
@@ -2249,6 +2390,612 @@ Item {
                              }
                         }
                     }
+
+                    // ====================================================
+                    // 回收站：独立页面，操作请求交由业务层处理并刷新数据源。
+                    // ====================================================
+                    ColumnLayout {
+                        id: trashPage
+                        anchors.fill: parent
+                        anchors.margins: 22
+                        spacing: 14
+                        visible: root.currentNav === "回收站"
+
+                        // 标题、搜索与刷新
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 54
+                            spacing: 12
+
+                            Column {
+                                Layout.fillWidth: true
+                                spacing: 4
+                                Text {
+                                    text: "回收站"
+                                    color: root.textDarkColor
+                                    font.pixelSize: 22
+                                    font.weight: Font.DemiBold
+                                }
+                                Text {
+                                    text: "管理已删除的内容，还原文件或释放存储空间"
+                                    color: root.textLightColor
+                                    font.pixelSize: 11
+                                }
+                            }
+
+                            Rectangle {
+                                Layout.preferredWidth: 230
+                                Layout.minimumWidth: 150
+                                Layout.preferredHeight: 36
+                                radius: 8
+                                color: "#FFFFFF"
+                                border.color: trashSearchField.activeFocus
+                                              ? root.primaryColor : "#E7ECF4"
+
+                                Row {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 11
+                                    anchors.rightMargin: 9
+                                    spacing: 7
+                                    Text {
+                                        text: "⌕"
+                                        color: "#98A5B9"
+                                        font.pixelSize: 21
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+                                    TextField {
+                                        id: trashSearchField
+                                        width: parent.width - 34
+                                        height: parent.height
+                                        placeholderText: "搜索已删除的内容"
+                                        color: root.textDarkColor
+                                        font.pixelSize: 11
+                                        selectByMouse: true
+                                        background: Item {}
+                                        onTextChanged: root.trashSearchKeyword = text.trim()
+                                    }
+                                }
+                            }
+
+                            Button {
+                                id: trashRefreshButton
+                                Layout.preferredWidth: 36
+                                Layout.preferredHeight: 36
+                                hoverEnabled: true
+                                enabled: !root.trashLoading
+                                background: Rectangle {
+                                    radius: 8
+                                    color: trashRefreshButton.hovered ? "#EEF2FF" : "#FFFFFF"
+                                    border.color: "#E7ECF4"
+                                }
+                                contentItem: Text {
+                                    text: "↻"
+                                    color: trashRefreshButton.enabled ? "#8290A8" : "#B9C3D2"
+                                    font.pixelSize: 18
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                onClicked: root.trashRefreshRequested()
+                                ToolTip.visible: hovered
+                                ToolTip.text: "刷新回收站"
+                            }
+                        }
+                        // 保留规则与清空入口
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 82
+                            radius: 11
+                            color: "#F0F3FF"
+                            border.color: "#E3E9FC"
+
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 18
+                                anchors.rightMargin: 18
+                                spacing: 13
+
+                                Rectangle {
+                                    Layout.preferredWidth: 46
+                                    Layout.preferredHeight: 46
+                                    radius: 13
+                                    color: "#E2E9FF"
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "⌫"
+                                        color: root.primaryColor
+                                        font.pixelSize: 23
+                                    }
+                                }
+
+                                Column {
+                                    Layout.fillWidth: true
+                                    spacing: 5
+                                    Text {
+                                        text: "已删除的内容将保留 " + root.trashRetentionDays + " 天"
+                                        color: root.textDarkColor
+                                        font.pixelSize: 14
+                                        font.weight: Font.DemiBold
+                                    }
+                                    Text {
+                                        text: "到期后自动彻底清除；还原后，文件和文件夹将返回原位置"
+                                        color: root.textMidColor
+                                        font.pixelSize: 10
+                                    }
+                                }
+
+                                Button {
+                                    id: emptyTrashButton
+                                    Layout.preferredWidth: 104
+                                    Layout.preferredHeight: 34
+                                    hoverEnabled: true
+                                    enabled: !root.trashLoading && trashListView.count > 0
+                                    background: Rectangle {
+                                        radius: 8
+                                        color: !emptyTrashButton.enabled ? "#F5F6FA"
+                                               : emptyTrashButton.down ? "#FCE7E5"
+                                               : emptyTrashButton.hovered ? "#FFF3F2" : "#FFFFFF"
+                                        border.color: emptyTrashButton.enabled ? "#EFD6D4" : "#E3E7EF"
+                                    }
+                                    contentItem: Text {
+                                        text: "清空回收站"
+                                        color: emptyTrashButton.enabled ? "#D76D68" : "#ABB4C2"
+                                        font.pixelSize: 11
+                                        font.weight: Font.Medium
+                                        horizontalAlignment: Text.AlignHCenter
+                                        verticalAlignment: Text.AlignVCenter
+                                    }
+                                    onClicked: trashActionDialog.openForEmpty()
+                                }
+                            }
+                        }
+                        // 已删除内容列表
+                        Rectangle {
+                            id: trashListCard
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            radius: 11
+                            color: "#FFFFFF"
+                            clip: true
+
+                            ColumnLayout {
+                                anchors.fill: parent
+                                spacing: 0
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Layout.preferredHeight: 50
+                                    Layout.leftMargin: 16
+                                    Layout.rightMargin: 14
+                                    spacing: 10
+
+                                    Text {
+                                        text: "已删除内容"
+                                        color: root.textDarkColor
+                                        font.pixelSize: 13
+                                        font.weight: Font.DemiBold
+                                    }
+                                    Text {
+                                        text: trashListView.count + " 个项目"
+                                        color: "#A7B2C2"
+                                        font.pixelSize: 10
+                                    }
+                                    Item { Layout.fillWidth: true }
+
+                                    Repeater {
+                                        model: ["全部", "文件", "文件夹"]
+                                        delegate: Item {
+                                            width: 43
+                                            height: 28
+                                            Rectangle {
+                                                anchors.fill: parent
+                                                radius: 6
+                                                color: root.trashFilter === modelData ? "#EEF2FF"
+                                                       : (trashFilterMouse.containsMouse ? "#F7F9FD" : "transparent")
+                                            }
+                                            Text {
+                                                anchors.centerIn: parent
+                                                text: modelData
+                                                color: root.trashFilter === modelData
+                                                       ? root.primaryColor : "#8592A8"
+                                                font.pixelSize: 10
+                                                font.weight: root.trashFilter === modelData
+                                                             ? Font.DemiBold : Font.Normal
+                                            }
+                                            MouseArea {
+                                                id: trashFilterMouse
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: root.trashFilter = modelData
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    height: 1
+                                    color: "#EEF1F6"
+                                }
+
+                                // 表头与数据行使用相同的固定列宽。
+                                Item {
+                                    Layout.fillWidth: true
+                                    height: 37
+                                    Row {
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        anchors.leftMargin: 16
+                                        anchors.rightMargin: 13
+                                        Text {
+                                            width: Math.max(0, parent.width - 455)
+                                            text: "名称"
+                                            color: "#9AA6B8"
+                                            font.pixelSize: 10
+                                        }
+                                        Text {
+                                            width: 140
+                                            text: "原位置"
+                                            color: "#9AA6B8"
+                                            font.pixelSize: 10
+                                        }
+                                        Text {
+                                            width: 120
+                                            text: "删除时间"
+                                            color: "#9AA6B8"
+                                            font.pixelSize: 10
+                                        }
+                                        Text {
+                                            width: 70
+                                            text: "大小"
+                                            color: "#9AA6B8"
+                                            font.pixelSize: 10
+                                        }
+                                        Text {
+                                            width: 125
+                                            text: "操作"
+                                            color: "#9AA6B8"
+                                            font.pixelSize: 10
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    height: 1
+                                    color: "#F1F3F8"
+                                }
+
+                                Item {
+                                    Layout.fillWidth: true
+                                    Layout.fillHeight: true
+
+                                    ListView {
+                                        id: trashListView
+                                        anchors.fill: parent
+                                        clip: true
+                                        model: root.trashModelSource
+                                        boundsBehavior: Flickable.StopAtBounds
+
+                                        ScrollBar.vertical: ScrollBar {
+                                            policy: ScrollBar.AsNeeded
+                                        }
+
+                                        delegate: Item {
+                                            id: trashRow
+                                            width: trashListView.width
+
+                                            property string filePath: root.trashItemPath(
+                                                typeof path === "undefined" ? "" : path, name)
+                                            property string sourceLocation: {
+                                                if (typeof location !== "undefined" && location !== null
+                                                        && location.toString().length > 0)
+                                                    return location.toString()
+                                                if (typeof originalPath !== "undefined" && originalPath !== null
+                                                        && originalPath.toString().length > 0)
+                                                    return originalPath.toString()
+                                                return "我的文件"
+                                            }
+                                            property string deletedAt: typeof deletedTime !== "undefined"
+                                                                       && deletedTime !== null
+                                                                       ? deletedTime.toString()
+                                                                       : (typeof modified !== "undefined" && modified !== null
+                                                                          ? modified.toString() : "未知")
+                                            property bool rowVisible: root.matchesTrashFilter(kind)
+                                                                      && root.matchesTrashSearch(name)
+                                            height: rowVisible ? 68 : 0
+                                            visible: rowVisible
+
+                                            Rectangle {
+                                                anchors.fill: parent
+                                                color: root.selectedTrashPath === trashRow.filePath ? "#F4F7FF"
+                                                       : (trashRowMouse.containsMouse ? "#FAFBFE" : "#FFFFFF")
+                                            }
+                                            Rectangle {
+                                                anchors.left: parent.left
+                                                anchors.right: parent.right
+                                                anchors.bottom: parent.bottom
+                                                height: 1
+                                                color: "#F3F5F9"
+                                            }
+
+                                            MouseArea {
+                                                id: trashRowMouse
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: root.selectedTrashPath = trashRow.filePath
+                                            }
+
+                                            ItemNameToolTip {
+                                                mouseArea: trashRowMouse
+                                                text: name
+                                                hoverAllowed: !restoreTrashButton.hovered
+                                                              && !permanentDeleteButton.hovered
+                                            }
+
+                                            Row {
+                                                anchors.left: parent.left
+                                                anchors.right: parent.right
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                anchors.leftMargin: 16
+                                                anchors.rightMargin: 13
+
+                                                Row {
+                                                    width: Math.max(0, parent.width - 455)
+                                                    height: 68
+                                                    spacing: 10
+                                                    clip: true
+                                                    Rectangle {
+                                                        width: 38
+                                                        height: 38
+                                                        radius: 9
+                                                        color: kind === "folder" ? "#FFF5E3" : iconBg
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        Text {
+                                                            anchors.centerIn: parent
+                                                            text: kind === "folder" ? "▰" : ext
+                                                            color: kind === "folder" ? "#E9AD4E" : iconColor
+                                                            font.pixelSize: kind === "folder" ? 19 : 9
+                                                            font.weight: Font.DemiBold
+                                                        }
+                                                    }
+                                                    Column {
+                                                        width: Math.max(0, parent.width - 48)
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        spacing: 4
+                                                        Text {
+                                                            width: parent.width
+                                                            text: name
+                                                            color: root.textDarkColor
+                                                            font.pixelSize: 11
+                                                            font.weight: Font.Medium
+                                                            elide: Text.ElideRight
+                                                        }
+                                                        Text {
+                                                            width: parent.width
+                                                            text: kind === "folder" ? "文件夹" : root.fileTypeDescription(ext)
+                                                            color: "#AAB4C3"
+                                                            font.pixelSize: 9
+                                                            elide: Text.ElideRight
+                                                        }
+                                                    }
+                                                }
+
+                                                Text {
+                                                    width: 140
+                                                    height: 68
+                                                    text: trashRow.sourceLocation
+                                                    color: "#8492A8"
+                                                    font.pixelSize: 10
+                                                    verticalAlignment: Text.AlignVCenter
+                                                    elide: Text.ElideMiddle
+                                                }
+                                                Text {
+                                                    width: 120
+                                                    height: 68
+                                                    text: trashRow.deletedAt
+                                                    color: "#8492A8"
+                                                    font.pixelSize: 10
+                                                    verticalAlignment: Text.AlignVCenter
+                                                    elide: Text.ElideRight
+                                                }
+                                                Text {
+                                                    width: 70
+                                                    height: 68
+                                                    text: size
+                                                    color: "#8492A8"
+                                                    font.pixelSize: 10
+                                                    verticalAlignment: Text.AlignVCenter
+                                                    elide: Text.ElideRight
+                                                }
+
+                                                Row {
+                                                    width: 125
+                                                    height: 68
+                                                    spacing: 6
+
+                                                    Button {
+                                                        id: restoreTrashButton
+                                                        width: 58
+                                                        height: 30
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        hoverEnabled: true
+                                                        enabled: !root.trashLoading
+                                                        background: Rectangle {
+                                                            radius: 7
+                                                            color: restoreTrashButton.down ? "#E2E9FF"
+                                                                   : restoreTrashButton.hovered ? "#EEF2FF" : "#F5F7FF"
+                                                            border.color: "#DFE6FA"
+                                                        }
+                                                        contentItem: Text {
+                                                            text: "还原"
+                                                            color: restoreTrashButton.enabled ? root.primaryColor : "#AAB4C3"
+                                                            font.pixelSize: 10
+                                                            font.weight: Font.Medium
+                                                            horizontalAlignment: Text.AlignHCenter
+                                                            verticalAlignment: Text.AlignVCenter
+                                                        }
+                                                        onClicked: {
+                                                            root.selectedTrashPath = trashRow.filePath
+                                                            root.trashRestoreRequested(name, trashRow.filePath)
+                                                        }
+                                                        ToolTip.visible: hovered && enabled
+                                                        ToolTip.text: "还原到原位置"
+                                                    }
+
+                                                    Button {
+                                                        id: permanentDeleteButton
+                                                        width: 58
+                                                        height: 30
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        hoverEnabled: true
+                                                        enabled: !root.trashLoading
+                                                        background: Rectangle {
+                                                            radius: 7
+                                                            color: permanentDeleteButton.down ? "#FCE7E5"
+                                                                   : permanentDeleteButton.hovered ? "#FFF3F2" : "transparent"
+                                                            border.color: permanentDeleteButton.hovered ? "#F0D8D5" : "transparent"
+                                                        }
+                                                        contentItem: Text {
+                                                            text: "删除"
+                                                            color: permanentDeleteButton.enabled ? "#D76D68" : "#B8C0CC"
+                                                            font.pixelSize: 10
+                                                            horizontalAlignment: Text.AlignHCenter
+                                                            verticalAlignment: Text.AlignVCenter
+                                                        }
+                                                        onClicked: {
+                                                            root.selectedTrashPath = trashRow.filePath
+                                                            trashActionDialog.openForDelete(name, trashRow.filePath)
+                                                        }
+                                                        ToolTip.visible: hovered && enabled
+                                                        ToolTip.text: "彻底删除，无法还原"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    BusyIndicator {
+                                        anchors.centerIn: parent
+                                        width: 30
+                                        height: 30
+                                        running: root.trashLoading
+                                        visible: running
+                                    }
+
+                                    // 回收站为空时提供明确的返回入口。
+                                    Column {
+                                        anchors.centerIn: parent
+                                        width: Math.min(340, parent.width - 40)
+                                        spacing: 9
+                                        visible: !root.trashLoading && trashListView.count === 0
+
+                                        Rectangle {
+                                            width: 64
+                                            height: 64
+                                            radius: 18
+                                            color: "#EEF2FF"
+                                            anchors.horizontalCenter: parent.horizontalCenter
+                                            Text {
+                                                anchors.centerIn: parent
+                                                text: "⌫"
+                                                color: root.primaryColor
+                                                font.pixelSize: 30
+                                            }
+                                        }
+                                        Text {
+                                            width: parent.width
+                                            text: "回收站是空的"
+                                            color: root.textDarkColor
+                                            font.pixelSize: 14
+                                            font.weight: Font.DemiBold
+                                            horizontalAlignment: Text.AlignHCenter
+                                        }
+                                        Text {
+                                            width: parent.width
+                                            text: "删除的文件和文件夹会暂时保存在这里，你可以随时还原。"
+                                            color: root.textMidColor
+                                            font.pixelSize: 10
+                                            wrapMode: Text.WordWrap
+                                            horizontalAlignment: Text.AlignHCenter
+                                        }
+                                        Button {
+                                            width: 112
+                                            height: 34
+                                            anchors.horizontalCenter: parent.horizontalCenter
+                                            hoverEnabled: true
+                                            background: Rectangle {
+                                                radius: 8
+                                                color: parent.down ? root.primaryDarkColor
+                                                       : parent.hovered ? "#5878F7" : root.primaryColor
+                                            }
+                                            contentItem: Text {
+                                                text: "浏览我的文件"
+                                                color: "#FFFFFF"
+                                                font.pixelSize: 11
+                                                horizontalAlignment: Text.AlignHCenter
+                                                verticalAlignment: Text.AlignVCenter
+                                            }
+                                            onClicked: {
+                                                root.currentNav = "我的文件"
+                                                root.clearSelection()
+                                                root.navigationChanged("我的文件")
+                                            }
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    height: 34
+                                    color: "#FCFDFF"
+                                    Rectangle {
+                                        anchors.top: parent.top
+                                        width: parent.width
+                                        height: 1
+                                        color: "#EEF1F6"
+                                    }
+                                    Row {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 16
+                                        anchors.rightMargin: 16
+                                        spacing: 6
+                                        Rectangle {
+                                            width: 6
+                                            height: 6
+                                            radius: 3
+                                            color: root.warningColor
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                        Text {
+                                            text: "回收站中的内容不会参与文件同步"
+                                            color: "#9AA7B9"
+                                            font.pixelSize: 9
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                        Item { width: 1; height: 1 }
+                                        Text {
+                                            text: "彻底删除后无法恢复"
+                                            color: "#AAB4C3"
+                                            font.pixelSize: 9
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                anchors.fill: parent
+                                radius: parent.radius
+                                color: "transparent"
+                                border.color: "#E9EEF6"
+                                border.width: 1
+                                antialiasing: true
+                                z: 100
+                            }
+                        }
+                    }
                 }
 
                 // ========================================================
@@ -2258,7 +3005,8 @@ Item {
                     id: detailsPanel
                     width: 270
                     height: parent.height
-                    visible: root.currentNav !== "收藏夹" && root.detailsVisible && workspace.width >= 850
+                    visible: root.currentNav !== "收藏夹" && root.currentNav !== "回收站"
+                             && root.detailsVisible && workspace.width >= 850
                     color: "#FFFFFF"
                     border.color: "#E9EEF6"
                     border.width: 1
@@ -2915,7 +3663,8 @@ Item {
 
         MenuItem {
             id: deleteMenuItem
-            text: "删除"
+            text: uploadManager.deleting ? "正在移入回收站…" : "删除"
+            enabled: !uploadManager.deleting && rowMenu.filePath.length > 0
             implicitHeight: 40
             hoverEnabled: true
             leftPadding: 6
@@ -2954,6 +3703,8 @@ Item {
                     elide: Text.ElideRight
                 }
             }
+
+            onTriggered: root.requestDelete(rowMenu.filePath, rowMenu.fileName, rowMenu.fileKind)
         }
     }
 
@@ -2961,6 +3712,25 @@ Item {
     ListModel {
         id: favoritesModel
         dynamicRoles: true
+    }
+
+    // 回收站数据由 UploadManager.trashLoaded 填充，也可通过 setTrashItems() 设置。
+    ListModel {
+        id: trashModel
+        dynamicRoles: true
+        /*
+        ListElement {
+            name: "旧版项目方案.pdf"
+            kind: "file"
+            ext: "PDF"
+            path: "旧版项目方案.pdf"
+            location: "我的文件 / 项目资料"
+            deletedTime: "今天 14:30"
+            size: "2.4 MB"
+            iconBg: "#FFF0EF"
+            iconColor: "#E47772"
+        }
+        */
     }
 
     // 示例文件数据：接入 C++ 后可替换为 QAbstractListModel
@@ -3051,6 +3821,296 @@ Item {
         */
     }
 
+
+    // 删除只移入应用回收站；文件夹及其全部内容由服务端一次性移动。
+    Dialog {
+        id: deleteConfirmDialog
+        anchors.centerIn: root
+        width: 430
+        height: 250
+        padding: 0
+        modal: true
+        focus: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+        property string fileName: ""
+        property string filePath: ""
+        property string fileKind: "file"
+
+        function openFor(path, name, kind) {
+            filePath = path
+            fileName = name
+            fileKind = kind
+            open()
+        }
+
+        function confirmDelete() {
+            if (uploadManager.deleting || filePath.length === 0)
+                return
+            var path = filePath
+            close()
+            uploadManager.deleteItem(path)
+        }
+
+        Overlay.modal: Rectangle { color: "#66000000" }
+        background: Rectangle {
+            color: "#FFFFFF"
+            radius: 13
+            border.width: 1
+            border.color: "#E4EAF4"
+            antialiasing: true
+        }
+
+        contentItem: Item {
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 22
+                spacing: 14
+
+                Row {
+                    Layout.fillWidth: true
+                    spacing: 11
+                    Rectangle {
+                        width: 38
+                        height: 38
+                        radius: 11
+                        color: "#FFF1F0"
+                        Text {
+                            anchors.centerIn: parent
+                            text: "⌫"
+                            color: "#D76561"
+                            font.pixelSize: 18
+                        }
+                    }
+                    Column {
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 3
+                        Text {
+                            text: deleteConfirmDialog.fileKind === "folder" ? "删除文件夹" : "删除文件"
+                            color: root.textDarkColor
+                            font.pixelSize: 16
+                            font.weight: Font.DemiBold
+                        }
+                        Text {
+                            text: "可在回收站中查看已删除内容"
+                            color: "#A2AEC0"
+                            font.pixelSize: 10
+                        }
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    text: deleteConfirmDialog.fileKind === "folder"
+                          ? "确定将文件夹“" + deleteConfirmDialog.fileName
+                            + "”移入回收站吗？文件夹内的全部文件、子文件夹和空目录都会一起移动。"
+                          : "确定将文件“" + deleteConfirmDialog.fileName + "”移入回收站吗？"
+                    color: root.textMidColor
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignVCenter
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 35
+                    spacing: 9
+                    Item { Layout.fillWidth: true }
+                    Button {
+                        id: cancelDeleteButton
+                        Layout.preferredWidth: 76
+                        Layout.preferredHeight: 34
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 8
+                            color: cancelDeleteButton.hovered ? "#F3F5F9" : "#FFFFFF"
+                            border.color: "#DFE5EF"
+                        }
+                        contentItem: Text {
+                            text: "取消"
+                            color: "#68778E"
+                            font.pixelSize: 11
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onClicked: deleteConfirmDialog.close()
+                    }
+                    Button {
+                        id: confirmDeleteButton
+                        Layout.preferredWidth: 104
+                        Layout.preferredHeight: 34
+                        hoverEnabled: true
+                        enabled: !uploadManager.deleting
+                        background: Rectangle {
+                            radius: 8
+                            color: !confirmDeleteButton.enabled ? "#E6B1AE"
+                                   : confirmDeleteButton.down ? "#BD514D"
+                                   : confirmDeleteButton.hovered ? "#E47772" : "#D76561"
+                        }
+                        contentItem: Text {
+                            text: uploadManager.deleting ? "正在删除…" : "移入回收站"
+                            color: "#FFFFFF"
+                            font.pixelSize: 11
+                            font.weight: Font.DemiBold
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onClicked: deleteConfirmDialog.confirmDelete()
+                    }
+                }
+            }
+        }
+    }
+
+    // 彻底删除与清空回收站共用确认弹窗，确认后仅发送请求，不在本地伪造成功结果。
+    Dialog {
+        id: trashActionDialog
+        anchors.centerIn: root
+        width: 420
+        height: 236
+        padding: 0
+        modal: true
+        focus: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+        property string actionType: "delete"
+        property string fileName: ""
+        property string filePath: ""
+
+        function openForDelete(name, path) {
+            actionType = "delete"
+            fileName = name
+            filePath = path
+            open()
+        }
+
+        function openForEmpty() {
+            actionType = "empty"
+            fileName = ""
+            filePath = ""
+            open()
+        }
+
+        function confirmAction() {
+            var type = actionType
+            var name = fileName
+            var path = filePath
+            close()
+            if (type === "empty")
+                root.trashEmptyRequested()
+            else
+                root.trashPermanentDeleteRequested(name, path)
+        }
+
+        Overlay.modal: Rectangle { color: "#66000000" }
+        background: Rectangle {
+            color: "#FFFFFF"
+            radius: 13
+            border.width: 1
+            border.color: "#E4EAF4"
+            antialiasing: true
+        }
+
+        contentItem: Item {
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 22
+                spacing: 14
+
+                Row {
+                    Layout.fillWidth: true
+                    spacing: 11
+                    Rectangle {
+                        width: 38
+                        height: 38
+                        radius: 11
+                        color: "#FFF1F0"
+                        Text {
+                            anchors.centerIn: parent
+                            text: "!"
+                            color: "#D76561"
+                            font.pixelSize: 19
+                            font.weight: Font.DemiBold
+                        }
+                    }
+                    Column {
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 3
+                        Text {
+                            text: trashActionDialog.actionType === "empty" ? "清空回收站" : "彻底删除"
+                            color: root.textDarkColor
+                            font.pixelSize: 16
+                            font.weight: Font.DemiBold
+                        }
+                        Text {
+                            text: "此操作无法撤销"
+                            color: "#A2AEC0"
+                            font.pixelSize: 10
+                        }
+                    }
+                }
+
+                Text {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    text: trashActionDialog.actionType === "empty"
+                          ? "回收站中的全部内容将被永久删除，且无法还原。确定继续吗？"
+                          : "“" + trashActionDialog.fileName + "”将被永久删除，且无法还原。确定继续吗？"
+                    color: root.textMidColor
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignVCenter
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 35
+                    spacing: 9
+                    Item { Layout.fillWidth: true }
+                    Button {
+                        id: cancelTrashActionButton
+                        Layout.preferredWidth: 76
+                        Layout.preferredHeight: 34
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 8
+                            color: cancelTrashActionButton.hovered ? "#F3F5F9" : "#FFFFFF"
+                            border.color: "#DFE5EF"
+                        }
+                        contentItem: Text {
+                            text: "取消"
+                            color: "#68778E"
+                            font.pixelSize: 11
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onClicked: trashActionDialog.close()
+                    }
+                    Button {
+                        id: confirmTrashActionButton
+                        Layout.preferredWidth: 94
+                        Layout.preferredHeight: 34
+                        hoverEnabled: true
+                        background: Rectangle {
+                            radius: 8
+                            color: confirmTrashActionButton.down ? "#BD514D"
+                                   : confirmTrashActionButton.hovered ? "#E47772" : "#D76561"
+                        }
+                        contentItem: Text {
+                            text: trashActionDialog.actionType === "empty" ? "确认清空" : "彻底删除"
+                            color: "#FFFFFF"
+                            font.pixelSize: 11
+                            font.weight: Font.DemiBold
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onClicked: trashActionDialog.confirmAction()
+                    }
+                }
+            }
+        }
+    }
 
     // 新建文件夹弹窗：名称校验、异步状态和错误提示均在当前操作上下文中完成。
     Dialog {
@@ -3184,7 +4244,7 @@ Item {
                     color: createFolderDialog.errorText.length > 0 ? "#D76D68" : "#9AA6B8"
                     font.pixelSize: 10
                     wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignTop
+                    verticalAlignment: Text.AlignVCenter
                 }
 
                 Item { Layout.fillHeight: true }
@@ -3418,7 +4478,7 @@ Item {
                     color: renameDialog.errorText.length > 0 ? "#D76D68" : "#9AA6B8"
                     font.pixelSize: 10
                     wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignTop
+                    verticalAlignment: Text.AlignVCenter
                 }
 
                 Item { Layout.fillHeight: true }
@@ -3838,7 +4898,7 @@ Item {
                     color: moveDialog.errorText.length > 0 ? "#D76D68" : "#9AA6B8"
                     font.pixelSize: 10
                     wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignTop
+                    verticalAlignment: Text.AlignVCenter
                 }
 
                 RowLayout {
@@ -3978,7 +5038,7 @@ Item {
                     color: root.textMidColor
                     font.pixelSize: 11
                     wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignTop
+                    verticalAlignment: Text.AlignVCenter
                 }
 
                 Button {
@@ -4061,6 +5121,7 @@ Item {
             searchField.text = ""
             root.clearSelection()
             rowMenu.close()
+            deleteConfirmDialog.close()
             renameDialog.close()
             moveDialog.close()
         }
@@ -4085,7 +5146,7 @@ Item {
                                       : item.name === root.pendingCreatedFolderName
                     if (item.kind === "folder" && pathMatches) {
                         root.selectFile(item.name, item.kind, item.modified, item.size,
-                                        item.status, item.ext)
+                                        item.status, item.ext, itemPath)
                         foundCreatedFolder = true
                         break
                     }
@@ -4106,7 +5167,8 @@ Item {
                                           ? "" : renamedItem.path.toString()
                     if (renamedItemPath === root.pendingRenamedPath) {
                         root.selectFile(renamedItem.name, renamedItem.kind, renamedItem.modified,
-                                        renamedItem.size, renamedItem.status, renamedItem.ext)
+                                        renamedItem.size, renamedItem.status, renamedItem.ext,
+                                        renamedItemPath)
                         break
                     }
                 }
@@ -4129,6 +5191,22 @@ Item {
 
         function onFavoritesLoadFailed(reason) {
             console.warn("加载收藏列表失败：" + reason)
+        }
+
+        function onTrashLoaded(items) {
+            root.setTrashItems(items)
+        }
+
+        function onTrashLoadFailed(reason) {
+            console.warn("加载回收站失败：" + reason)
+            if (root.currentNav === "回收站")
+                favoriteResultDialog.showResult(false, "加载回收站失败：" + reason)
+        }
+
+        function onServerFilesChanged(paths, revision) {
+            // 其他客户端删除内容时，正在查看的回收站也保持同步。
+            if (root.currentNav === "回收站")
+                uploadManager.loadTrash()
         }
 
         function onFavoriteAdded(path, addedCount, favoriteCount) {
@@ -4216,6 +5294,22 @@ Item {
             if (!moveDialog.opened)
                 return
             moveDialog.errorText = reason
+        }
+
+        function onItemDeleted(sourcePath, trashId) {
+            root.clearSelection()
+            rowMenu.close()
+            deleteConfirmDialog.close()
+
+            // 只有服务端确认移动成功后才更新界面；WebSocket 负责同步其他客户端。
+            uploadManager.loadFiles()
+            uploadManager.loadFavorites()
+            uploadManager.loadTrash()
+            favoriteResultDialog.showResult(true, "已移入回收站，文件及文件夹内容均已保留。")
+        }
+
+        function onItemDeleteFailed(sourcePath, reason) {
+            favoriteResultDialog.showResult(false, "删除失败：" + reason)
         }
 
         // 所有上传任务完成。在线时等待服务器事件，避免每个文件都重复刷新。

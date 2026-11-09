@@ -22,6 +22,9 @@ class QWebSocket;
  *   GET  /folders?path= 返回指定目录的直接子文件夹，供移动目标选择器使用
  *   POST /rename      接收 JSON { "path": "原云端路径", "newName": "新名称" }
  *   POST /move        接收 JSON { "path": "原云端路径", "destinationPath": "目标文件夹" }
+ *   GET  /favorites   返回真实收藏列表；文件夹及其后代分别作为独立收藏项
+ *   POST /favorites   接收 JSON { "path": "云端路径", "recursive": true }
+ *   POST /favorites/remove 取消指定路径收藏；recursive 为 true 时同时取消后代
  *   GET  /files?path= 返回指定目录的直接子项，以及该目录的递归文件统计
  *   GET  /file?path=  返回指定文件内容，供 QML 图片/文本/文档预览使用
  *                      可选 offset/maxBytes 用于文本分块加载
@@ -56,6 +59,13 @@ private:
     void registerItemOrder(const QString &cloudPath);
     void moveItemOrder(const QString &oldCloudPath, const QString &newCloudPath);
 
+    // 收藏只保存云端相对路径和收藏时间，元数据文件不放在 uploaded_files 内。
+    void loadFavorites();
+    bool saveFavorites() const;
+    void synchronizeFavorites();
+    void moveFavorites(const QString &oldCloudPath, const QString &newCloudPath);
+    void broadcastFavoritesChanged(const QString &cloudPath);
+
     void readRequest(QTcpSocket *socket);
     void processRequest(QTcpSocket *socket,
                         const QUrl &requestUrl,
@@ -67,6 +77,11 @@ private:
     void processCreateFolderRequest(QTcpSocket *socket, const QByteArray &body);
     void processRenameRequest(QTcpSocket *socket, const QByteArray &body);
     void processMoveRequest(QTcpSocket *socket, const QByteArray &body);
+    void processFavoritesRequest(QTcpSocket *socket);
+    void processAddFavoriteRequest(QTcpSocket *socket, const QByteArray &body);
+    void processRemoveFavoriteRequest(QTcpSocket *socket, const QByteArray &body);
+    void processTrashRequest(QTcpSocket *socket);
+    void processMoveToTrashRequest(QTcpSocket *socket, const QByteArray &body);
     void sendJson(QTcpSocket *socket, int statusCode,
                   const QByteArray &reason,
                   const QByteArray &jsonBody);
@@ -81,6 +96,7 @@ private:
     QSet<QString> m_knownPaths;
     QSet<QString> m_pendingChanges;
     QHash<QString, quint64> m_itemOrder;
+    QHash<QString, QString> m_favoriteTimes;
     QString m_storageRoot;
     quint64 m_nextItemOrder = 1;
     quint64 m_revision = 0;

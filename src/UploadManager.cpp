@@ -372,6 +372,11 @@ QVariantMap makeFileItem(const QJsonObject &object)
     item.insert(QStringLiteral("path"), path.isEmpty() ? name : path);
     item.insert(QStringLiteral("previewType"), object.value(QStringLiteral("previewType")).toString());
     item.insert(QStringLiteral("mimeType"), object.value(QStringLiteral("mimeType")).toString());
+    item.insert(QStringLiteral("favorite"), object.value(QStringLiteral("favorite")).toBool(false));
+    item.insert(QStringLiteral("favoriteTime"), object.value(QStringLiteral("favoriteTime")).toString());
+    item.insert(QStringLiteral("location"), object.value(QStringLiteral("location")).toString());
+    item.insert(QStringLiteral("originalPath"), object.value(QStringLiteral("originalPath")).toString());
+    item.insert(QStringLiteral("deletedTime"), object.value(QStringLiteral("deletedTime")).toString());
     return item;
 }
 
@@ -383,6 +388,7 @@ UploadManager::UploadManager(QObject *parent)
 {
     m_reconnectTimer.setSingleShot(true);
     m_refreshTimer.setSingleShot(true);
+    m_favoritesRefreshTimer.setSingleShot(true);
     m_handshakeTimer.setSingleShot(true);
     m_handshakeTimer.setInterval(15000);
     m_pingTimer.setInterval(30000);
@@ -391,6 +397,8 @@ UploadManager::UploadManager(QObject *parent)
             this, &UploadManager::openWebSocket);
     connect(&m_refreshTimer, &QTimer::timeout,
             this, &UploadManager::loadFiles);
+    connect(&m_favoritesRefreshTimer, &QTimer::timeout,
+            this, &UploadManager::loadFavorites);
     connect(&m_handshakeTimer, &QTimer::timeout, this, [this]() {
         if (m_eventSocket.state() == QAbstractSocket::ConnectingState) {
             setWebSocketStatus(QStringLiteral("实时同步连接超时，正在重试…"));
@@ -413,6 +421,7 @@ UploadManager::UploadManager(QObject *parent)
 
         // 断线期间可能错过事件，每次建立连接都进行一次全量对账。
         scheduleFilesRefresh(0);
+        scheduleFavoritesRefresh(0);
     });
     connect(&m_eventSocket, &QWebSocket::disconnected, this, [this]() {
         m_handshakeTimer.stop();
@@ -447,12 +456,41 @@ UploadManager::~UploadManager()
     m_shuttingDown = true;
     m_reconnectTimer.stop();
     m_refreshTimer.stop();
+    m_favoritesRefreshTimer.stop();
     m_pingTimer.stop();
     m_handshakeTimer.stop();
     m_eventSocket.abort();
+    if (m_favoriteReply) {
+        QNetworkReply *reply = m_favoriteReply;
+        m_favoriteReply = nullptr;
+        disconnect(reply, nullptr, this, nullptr);
+        reply->abort();
+        reply->deleteLater();
+    }
+    if (m_favoriteListReply) {
+        QNetworkReply *reply = m_favoriteListReply;
+        m_favoriteListReply = nullptr;
+        disconnect(reply, nullptr, this, nullptr);
+        reply->abort();
+        reply->deleteLater();
+    }
     if (m_moveReply) {
         QNetworkReply *reply = m_moveReply;
         m_moveReply = nullptr;
+        disconnect(reply, nullptr, this, nullptr);
+        reply->abort();
+        reply->deleteLater();
+    }
+    if (m_deleteReply) {
+        QNetworkReply *reply = m_deleteReply;
+        m_deleteReply = nullptr;
+        disconnect(reply, nullptr, this, nullptr);
+        reply->abort();
+        reply->deleteLater();
+    }
+    if (m_trashListReply) {
+        QNetworkReply *reply = m_trashListReply;
+        m_trashListReply = nullptr;
         disconnect(reply, nullptr, this, nullptr);
         reply->abort();
         reply->deleteLater();
@@ -482,6 +520,10 @@ bool UploadManager::moving() const { return m_moving; }
 bool UploadManager::loadingFolderChoices() const { return m_loadingFolderChoices; }
 bool UploadManager::openingFile() const { return m_openingFile; }
 bool UploadManager::downloading() const { return m_downloading; }
+bool UploadManager::loadingFavorites() const { return m_loadingFavorites; }
+bool UploadManager::updatingFavorite() const { return m_updatingFavorite; }
+bool UploadManager::deleting() const { return m_deleting; }
+bool UploadManager::loadingTrash() const { return m_loadingTrash; }
 int UploadManager::progress() const { return m_progress; }
 QString UploadManager::currentFile() const { return m_currentFile; }
 QString UploadManager::statusText() const { return m_statusText; }
@@ -631,6 +673,13 @@ void UploadManager::scheduleFilesRefresh(int delayMs)
     m_refreshTimer.start(qMax(0, delayMs));
 }
 
+void UploadManager::scheduleFavoritesRefresh(int delayMs)
+{
+    if (m_shuttingDown || m_favoritesRefreshTimer.isActive())
+        return;
+    m_favoritesRefreshTimer.start(qMax(0, delayMs));
+}
+
 bool UploadManager::eventAffectsCurrentPath(const QStringList &paths) const
 {
     if (paths.isEmpty() || m_currentPath.isEmpty())
@@ -667,11 +716,18 @@ void UploadManager::handleWebSocketMessage(const QString &message)
         m_lastEventRevision = revision;
         return;
     }
-    if (type != QStringLiteral("filesChanged"))
+    const bool isFilesChanged = type == QStringLiteral("filesChanged");
+    const bool isFavoritesChanged = type == QStringLiteral("favoritesChanged");
+    if (!isFilesChanged && !isFavoritesChanged)
         return;
     if (revision > 0 && revision <= m_lastEventRevision)
         return;
     m_lastEventRevision = revision;
+
+    if (isFavoritesChanged) {
+        scheduleFavoritesRefresh();
+        return;
+    }
 
     QStringList paths;
     const QJsonArray pathArray = event.value(QStringLiteral("paths")).toArray();
@@ -680,6 +736,8 @@ void UploadManager::handleWebSocketMessage(const QString &message)
         paths.append(value.toString());
 
     emit serverFilesChanged(paths, revision);
+    // 文件改名、移动、删除或元数据变化也可能影响收藏页，不只刷新当前目录。
+    scheduleFavoritesRefresh();
     if (!eventAffectsCurrentPath(paths))
         return;
 
@@ -898,6 +956,267 @@ void UploadManager::loadFiles()
                           .arg(serverTotal)
                           .arg(items.size()));
         emit filesLoaded(items);
+    });
+}
+
+void UploadManager::loadFavorites()
+{
+    if (m_favoriteListReply) {
+        QNetworkReply *oldReply = m_favoriteListReply;
+        m_favoriteListReply = nullptr;
+        disconnect(oldReply, nullptr, this, nullptr);
+        oldReply->abort();
+        oldReply->deleteLater();
+    }
+
+    QUrl endpoint(m_fileListUrl);
+    if (!endpoint.isValid()
+        || (endpoint.scheme() != QStringLiteral("http")
+            && endpoint.scheme() != QStringLiteral("https"))) {
+        const QString reason = QStringLiteral("文件服务地址无效：请填写 http 或 https 地址");
+        setLoadingFavorites(false);
+        emit favoritesLoadFailed(reason);
+        return;
+    }
+
+    QString basePath = endpoint.path();
+    const int lastSlash = basePath.lastIndexOf(QLatin1Char('/'));
+    basePath = lastSlash >= 0 ? basePath.left(lastSlash + 1) : QStringLiteral("/");
+    endpoint.setPath(basePath + QStringLiteral("favorites"));
+    endpoint.setQuery(QUrlQuery());
+    endpoint.setFragment(QString());
+
+    QNetworkRequest request(endpoint);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setRawHeader(QByteArrayLiteral("Cache-Control"), QByteArrayLiteral("no-cache"));
+    request.setTransferTimeout(30000);
+
+    setLoadingFavorites(true);
+    QNetworkReply *reply = m_network.get(request);
+    m_favoriteListReply = reply;
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        if (reply != m_favoriteListReply) {
+            reply->deleteLater();
+            return;
+        }
+
+        m_favoriteListReply = nullptr;
+        const QByteArray body = reply->readAll();
+        const int httpStatus = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString networkError = reply->errorString();
+        const bool hasNetworkError = reply->error() != QNetworkReply::NoError;
+        reply->deleteLater();
+
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(body, &parseError);
+        const bool hasJsonObject = parseError.error == QJsonParseError::NoError
+                                   && document.isObject();
+        QJsonObject responseObject = hasJsonObject ? document.object() : QJsonObject();
+        const QString serverMessage = responseObject.value(QStringLiteral("message")).toString();
+
+        QString error;
+        if (hasNetworkError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = serverMessage.isEmpty() ? networkError : serverMessage;
+            if (error.trimmed().isEmpty())
+                error = QStringLiteral("服务器返回异常响应");
+            if (serverMessage.isEmpty() && httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        } else if (!hasJsonObject) {
+            error = QStringLiteral("服务器返回的收藏列表不是有效 JSON 对象");
+        } else if (responseObject.contains(QStringLiteral("success"))
+                   && !responseObject.value(QStringLiteral("success")).toBool()) {
+            error = serverMessage.isEmpty()
+                ? QStringLiteral("服务器未能返回收藏列表") : serverMessage;
+        }
+
+        if (!error.isEmpty()) {
+            setLoadingFavorites(false);
+            emit favoritesLoadFailed(error);
+            return;
+        }
+
+        if (responseObject.value(QStringLiteral("data")).isObject())
+            responseObject = responseObject.value(QStringLiteral("data")).toObject();
+        if (!responseObject.value(QStringLiteral("items")).isArray()) {
+            setLoadingFavorites(false);
+            emit favoritesLoadFailed(QStringLiteral("收藏列表响应缺少 items 数组"));
+            return;
+        }
+
+        QVariantList items;
+        const QJsonArray entries = responseObject.value(QStringLiteral("items")).toArray();
+        items.reserve(entries.size());
+        for (const QJsonValue &value : entries) {
+            if (!value.isObject())
+                continue;
+
+            QVariantMap item = makeFileItem(value.toObject());
+            QString itemPath;
+            if (!normalizeCloudPath(item.value(QStringLiteral("path")).toString(), &itemPath)
+                || itemPath.isEmpty()
+                || item.value(QStringLiteral("name")).toString().isEmpty()) {
+                continue;
+            }
+            item.insert(QStringLiteral("path"), itemPath);
+            item.insert(QStringLiteral("favorite"), true);
+            if (item.value(QStringLiteral("favoriteTime")).toString().isEmpty())
+                item.insert(QStringLiteral("favoriteTime"), item.value(QStringLiteral("modified")));
+            if (item.value(QStringLiteral("location")).toString().isEmpty()) {
+                const int separator = itemPath.lastIndexOf(QLatin1Char('/'));
+                const QString parentPath = separator >= 0
+                    ? itemPath.left(separator) : QString();
+                item.insert(QStringLiteral("location"), parentPath.isEmpty()
+                            ? QStringLiteral("我的文件")
+                            : QStringLiteral("我的文件 / ") + parentPath);
+            }
+            items.append(item);
+        }
+
+        setLoadingFavorites(false);
+        emit favoritesLoaded(items);
+    });
+}
+
+void UploadManager::addFavorite(const QString &path)
+{
+    setFavorite(path, true);
+}
+
+void UploadManager::removeFavorite(const QString &path)
+{
+    setFavorite(path, false);
+}
+
+void UploadManager::setFavorite(const QString &path, bool favorite)
+{
+    QString sourcePath;
+    const bool validPath = normalizeCloudPath(path, &sourcePath);
+    const QString reportedPath = validPath ? sourcePath : path;
+
+    auto failStart = [this, reportedPath, favorite](const QString &reason) {
+        setListStatus((favorite ? QStringLiteral("添加收藏失败：")
+                                : QStringLiteral("取消收藏失败：")) + reason);
+        if (favorite)
+            emit favoriteAddFailed(reportedPath, reason);
+        else
+            emit favoriteRemoveFailed(reportedPath, reason);
+    };
+
+    if (m_updatingFavorite) {
+        failStart(QStringLiteral("正在处理其他收藏操作，请稍后再试"));
+        return;
+    }
+    if (!validPath || sourcePath.isEmpty()) {
+        failStart(QStringLiteral("文件或文件夹路径无效或不安全"));
+        return;
+    }
+
+    QUrl endpoint(m_fileListUrl);
+    if (!endpoint.isValid()
+        || (endpoint.scheme() != QStringLiteral("http")
+            && endpoint.scheme() != QStringLiteral("https"))) {
+        failStart(QStringLiteral("文件服务地址无效：请填写 http 或 https 地址"));
+        return;
+    }
+
+    QString basePath = endpoint.path();
+    const int lastSlash = basePath.lastIndexOf(QLatin1Char('/'));
+    basePath = lastSlash >= 0 ? basePath.left(lastSlash + 1) : QStringLiteral("/");
+    endpoint.setPath(basePath + (favorite ? QStringLiteral("favorites")
+                                         : QStringLiteral("favorites/remove")));
+    endpoint.setQuery(QUrlQuery());
+    endpoint.setFragment(QString());
+
+    QNetworkRequest request(endpoint);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setRawHeader(QByteArrayLiteral("Content-Type"),
+                         QByteArrayLiteral("application/json; charset=utf-8"));
+    request.setTransferTimeout(120000);
+
+    const QJsonObject payload{
+        {QStringLiteral("path"), sourcePath},
+        {QStringLiteral("recursive"), true}
+    };
+    const QString itemName = QFileInfo(sourcePath).fileName();
+    setUpdatingFavorite(true);
+    setListStatus(favorite ? QStringLiteral("正在添加收藏：%1").arg(itemName)
+                           : QStringLiteral("正在取消收藏：%1").arg(itemName));
+
+    QNetworkReply *reply = m_network.post(
+        request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
+    m_favoriteReply = reply;
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, sourcePath, itemName, favorite]() {
+        if (reply != m_favoriteReply) {
+            reply->deleteLater();
+            return;
+        }
+
+        m_favoriteReply = nullptr;
+        const QByteArray body = reply->readAll();
+        const int httpStatus = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString networkError = reply->errorString();
+        const bool hasNetworkError = reply->error() != QNetworkReply::NoError;
+        reply->deleteLater();
+
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(body, &parseError);
+        const bool hasJsonObject = parseError.error == QJsonParseError::NoError
+                                   && document.isObject();
+        const QJsonObject responseObject = hasJsonObject ? document.object() : QJsonObject();
+        const QString serverMessage = responseObject.value(QStringLiteral("message")).toString();
+
+        QString error;
+        if (hasNetworkError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = serverMessage.isEmpty() ? networkError : serverMessage;
+            if (error.trimmed().isEmpty())
+                error = QStringLiteral("服务器返回异常响应");
+            if (serverMessage.isEmpty() && httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        } else if (!hasJsonObject) {
+            error = QStringLiteral("服务器返回的收藏结果不是有效 JSON 对象");
+        } else if (responseObject.contains(QStringLiteral("success"))
+                   && !responseObject.value(QStringLiteral("success")).toBool()) {
+            error = serverMessage.isEmpty()
+                ? QStringLiteral("服务器未能完成收藏操作") : serverMessage;
+        }
+
+        if (!error.isEmpty()) {
+            setUpdatingFavorite(false);
+            setListStatus((favorite ? QStringLiteral("添加收藏失败：")
+                                    : QStringLiteral("取消收藏失败：")) + error);
+            if (favorite)
+                emit favoriteAddFailed(sourcePath, error);
+            else
+                emit favoriteRemoveFailed(sourcePath, error);
+            return;
+        }
+
+        setUpdatingFavorite(false);
+        const int favoriteCount = qMax(0, responseObject.value(
+            QStringLiteral("favoriteCount")).toInt());
+        if (favorite) {
+            const int addedCount = qMax(0, responseObject.value(
+                QStringLiteral("addedCount")).toInt());
+            setListStatus(addedCount > 0
+                ? QStringLiteral("收藏“%1”完成，新增 %2 个收藏项目")
+                      .arg(itemName).arg(addedCount)
+                : QStringLiteral("“%1”的所选内容均已在收藏夹中").arg(itemName));
+            emit favoriteAdded(sourcePath, addedCount, favoriteCount);
+        } else {
+            const int removedCount = qMax(0, responseObject.value(
+                QStringLiteral("removedCount")).toInt());
+            setListStatus(removedCount > 0
+                ? QStringLiteral("已取消收藏“%1”，共移除 %2 个收藏入口")
+                      .arg(itemName).arg(removedCount)
+                : QStringLiteral("“%1”原本就不在收藏夹中").arg(itemName));
+            emit favoriteRemoved(sourcePath, removedCount, favoriteCount);
+        }
+        loadFavorites();
     });
 }
 
@@ -1296,6 +1615,215 @@ void UploadManager::moveItem(const QString &path, const QString &destinationPath
             ? QStringLiteral("我的文件") : actualDestination;
         setListStatus(QStringLiteral("“%1”已移动到“%2”").arg(itemName, location));
         emit itemMoved(sourcePath, newPath, actualDestination);
+    });
+}
+
+void UploadManager::deleteItem(const QString &path)
+{
+    QString sourcePath;
+    const bool validPath = normalizeCloudPath(path, &sourcePath);
+    const QString reportedPath = validPath ? sourcePath : path;
+    if (m_deleting) {
+        const QString reason = QStringLiteral("正在删除其他项目，请稍后再试");
+        setListStatus(reason);
+        emit itemDeleteFailed(reportedPath, reason);
+        return;
+    }
+    if (!validPath || sourcePath.isEmpty()) {
+        const QString reason = QStringLiteral("文件或文件夹路径无效或不安全");
+        setListStatus(QStringLiteral("删除失败：%1").arg(reason));
+        emit itemDeleteFailed(reportedPath, reason);
+        return;
+    }
+
+    QUrl endpoint(m_fileListUrl);
+    if (!endpoint.isValid()
+        || (endpoint.scheme() != QStringLiteral("http")
+            && endpoint.scheme() != QStringLiteral("https"))) {
+        const QString reason = QStringLiteral("文件服务地址无效：请填写 http 或 https 地址");
+        setListStatus(reason);
+        emit itemDeleteFailed(sourcePath, reason);
+        return;
+    }
+
+    QString basePath = endpoint.path();
+    const int lastSlash = basePath.lastIndexOf(QLatin1Char('/'));
+    basePath = lastSlash >= 0 ? basePath.left(lastSlash + 1) : QStringLiteral("/");
+    endpoint.setPath(basePath + QStringLiteral("trash"));
+    endpoint.setQuery(QUrlQuery());
+    endpoint.setFragment(QString());
+
+    QNetworkRequest request(endpoint);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setRawHeader(QByteArrayLiteral("Content-Type"),
+                         QByteArrayLiteral("application/json; charset=utf-8"));
+    // 跨磁盘移动大文件夹时，服务端可能需要先复制再清理源目录。
+    request.setTransferTimeout(120000);
+
+    const QJsonObject payload{{QStringLiteral("path"), sourcePath}};
+    const QString itemName = QFileInfo(sourcePath).fileName();
+    setDeleting(true);
+    setListStatus(QStringLiteral("正在将“%1”移入回收站…").arg(itemName));
+    QNetworkReply *reply = m_network.post(
+        request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
+    m_deleteReply = reply;
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply, sourcePath, itemName]() {
+        if (reply != m_deleteReply) {
+            reply->deleteLater();
+            return;
+        }
+
+        m_deleteReply = nullptr;
+        const QByteArray responseBody = reply->readAll();
+        const int httpStatus = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString networkError = reply->errorString();
+        const bool hasNetworkError = reply->error() != QNetworkReply::NoError;
+        reply->deleteLater();
+
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(responseBody, &parseError);
+        const bool hasJsonObject = parseError.error == QJsonParseError::NoError
+                                   && document.isObject();
+        const QJsonObject responseObject = hasJsonObject ? document.object() : QJsonObject();
+        const QString serverMessage = responseObject.value(QStringLiteral("message")).toString();
+
+        QString error;
+        if (hasNetworkError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = serverMessage.isEmpty() ? networkError : serverMessage;
+            if (error.trimmed().isEmpty())
+                error = QStringLiteral("服务器返回异常响应");
+            if (serverMessage.isEmpty() && httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        } else if (!responseBody.isEmpty() && !hasJsonObject) {
+            error = QStringLiteral("服务器返回的删除结果不是有效 JSON 对象");
+        } else if (responseObject.contains(QStringLiteral("success"))
+                   && !responseObject.value(QStringLiteral("success")).toBool()) {
+            error = serverMessage.isEmpty()
+                ? QStringLiteral("服务器未能将项目移入回收站") : serverMessage;
+        }
+
+        if (!error.isEmpty()) {
+            setDeleting(false);
+            setListStatus(QStringLiteral("删除失败：%1").arg(error));
+            emit itemDeleteFailed(sourcePath, error);
+            return;
+        }
+
+        QString trashId = responseObject.value(QStringLiteral("trashId")).toString();
+        if (trashId.isEmpty())
+            trashId = responseObject.value(QStringLiteral("id")).toString();
+        if (trashId.isEmpty())
+            trashId = responseObject.value(QStringLiteral("path")).toString();
+
+        setDeleting(false);
+        setListStatus(QStringLiteral("“%1”已移入回收站").arg(itemName));
+        emit itemDeleted(sourcePath, trashId);
+    });
+}
+
+void UploadManager::loadTrash()
+{
+    // 回收站刷新以最后一次请求为准，避免旧响应覆盖新数据。
+    if (m_trashListReply) {
+        QNetworkReply *oldReply = m_trashListReply;
+        m_trashListReply = nullptr;
+        disconnect(oldReply, nullptr, this, nullptr);
+        oldReply->abort();
+        oldReply->deleteLater();
+    }
+
+    QUrl endpoint(m_fileListUrl);
+    if (!endpoint.isValid()
+        || (endpoint.scheme() != QStringLiteral("http")
+            && endpoint.scheme() != QStringLiteral("https"))) {
+        const QString reason = QStringLiteral("文件服务地址无效：请填写 http 或 https 地址");
+        setLoadingTrash(false);
+        emit trashLoadFailed(reason);
+        return;
+    }
+
+    QString basePath = endpoint.path();
+    const int lastSlash = basePath.lastIndexOf(QLatin1Char('/'));
+    basePath = lastSlash >= 0 ? basePath.left(lastSlash + 1) : QStringLiteral("/");
+    endpoint.setPath(basePath + QStringLiteral("trash"));
+    endpoint.setQuery(QUrlQuery());
+    endpoint.setFragment(QString());
+
+    QNetworkRequest request(endpoint);
+    request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
+    request.setRawHeader(QByteArrayLiteral("Cache-Control"), QByteArrayLiteral("no-cache"));
+    request.setTransferTimeout(30000);
+
+    setLoadingTrash(true);
+    QNetworkReply *reply = m_network.get(request);
+    m_trashListReply = reply;
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        if (reply != m_trashListReply) {
+            reply->deleteLater();
+            return;
+        }
+
+        m_trashListReply = nullptr;
+        const QByteArray responseBody = reply->readAll();
+        const int httpStatus = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QString networkError = reply->errorString();
+        const bool hasNetworkError = reply->error() != QNetworkReply::NoError;
+        reply->deleteLater();
+
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(responseBody, &parseError);
+        const bool hasJsonObject = parseError.error == QJsonParseError::NoError
+                                   && document.isObject();
+        QJsonObject responseObject = hasJsonObject ? document.object() : QJsonObject();
+        const QString serverMessage = responseObject.value(QStringLiteral("message")).toString();
+
+        QString error;
+        if (hasNetworkError
+            || (httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))) {
+            error = serverMessage.isEmpty() ? networkError : serverMessage;
+            if (error.trimmed().isEmpty())
+                error = QStringLiteral("服务器返回异常响应");
+            if (serverMessage.isEmpty() && httpStatus > 0)
+                error = QStringLiteral("HTTP %1：%2").arg(httpStatus).arg(error);
+        } else if (!hasJsonObject) {
+            error = QStringLiteral("服务器返回的回收站列表不是有效 JSON 对象");
+        } else if (responseObject.contains(QStringLiteral("success"))
+                   && !responseObject.value(QStringLiteral("success")).toBool()) {
+            error = serverMessage.isEmpty()
+                ? QStringLiteral("服务器未能返回回收站列表") : serverMessage;
+        }
+
+        if (responseObject.value(QStringLiteral("data")).isObject())
+            responseObject = responseObject.value(QStringLiteral("data")).toObject();
+        const QJsonValue itemsValue = responseObject.value(QStringLiteral("items"));
+        if (error.isEmpty() && !itemsValue.isArray())
+            error = QStringLiteral("回收站列表响应缺少 items 数组");
+
+        if (!error.isEmpty()) {
+            setLoadingTrash(false);
+            emit trashLoadFailed(error);
+            return;
+        }
+
+        QVariantList items;
+        const QJsonArray entries = itemsValue.toArray();
+        items.reserve(entries.size());
+        for (const QJsonValue &value : entries) {
+            if (!value.isObject())
+                continue;
+            QVariantMap item = makeFileItem(value.toObject());
+            if (!item.value(QStringLiteral("name")).toString().isEmpty()
+                && !item.value(QStringLiteral("path")).toString().isEmpty()) {
+                items.append(item);
+            }
+        }
+
+        setLoadingTrash(false);
+        emit trashLoaded(items);
     });
 }
 
@@ -2858,6 +3386,38 @@ void UploadManager::setDownloading(bool value)
         return;
     m_downloading = value;
     emit downloadingChanged();
+}
+
+void UploadManager::setLoadingFavorites(bool value)
+{
+    if (m_loadingFavorites == value)
+        return;
+    m_loadingFavorites = value;
+    emit loadingFavoritesChanged();
+}
+
+void UploadManager::setUpdatingFavorite(bool value)
+{
+    if (m_updatingFavorite == value)
+        return;
+    m_updatingFavorite = value;
+    emit updatingFavoriteChanged();
+}
+
+void UploadManager::setDeleting(bool value)
+{
+    if (m_deleting == value)
+        return;
+    m_deleting = value;
+    emit deletingChanged();
+}
+
+void UploadManager::setLoadingTrash(bool value)
+{
+    if (m_loadingTrash == value)
+        return;
+    m_loadingTrash = value;
+    emit loadingTrashChanged();
 }
 
 void UploadManager::setProgress(int value)

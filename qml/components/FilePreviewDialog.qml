@@ -714,6 +714,10 @@ Dialog {
                 }
 
                 ScrollBar.vertical: ScrollBar {
+                    parent: textFlick.parent
+                    anchors.top: textFlick.top
+                    anchors.right: parent.right
+                    anchors.bottom: textFlick.bottom
                     policy: ScrollBar.AsNeeded
                 }
             }
